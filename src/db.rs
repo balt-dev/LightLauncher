@@ -1,4 +1,7 @@
-use std::{path::{Path, PathBuf}, sync::{Mutex, atomic::AtomicBool}};
+use std::{
+    path::{Path, PathBuf},
+    sync::{Mutex, atomic::AtomicBool},
+};
 
 use rusqlite::Connection;
 
@@ -7,22 +10,25 @@ static DB_INIT: AtomicBool = AtomicBool::new(false);
 pub struct Database {
     root: PathBuf,
     blobs: PathBuf,
-    conn: Mutex<Connection>
+    conn: Mutex<Connection>,
 }
 
 impl Database {
     pub fn init(datapath: &Path) -> Result<Database, anyhow::Error> {
-        if DB_INIT.load(std::sync::atomic::Ordering::Relaxed) { return Err(anyhow::anyhow!("database already initialized")); }
+        if DB_INIT.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(anyhow::anyhow!("database already initialized"));
+        }
         DB_INIT.store(true, std::sync::atomic::Ordering::Relaxed);
-                
+
         let root = datapath.to_path_buf();
         let blobs = datapath.join("blobs");
-        
+
         std::fs::create_dir_all(&blobs)?;
-        
+
         let conn = Connection::open(datapath.join("content.db"))?;
-        
-        conn.execute_batch("
+
+        conn.execute_batch(
+            "
             BEGIN;
             PRAGMA foreign_keys = ON;
             
@@ -84,14 +90,16 @@ impl Database {
                     REFERENCES ContentVersion(Id) ON DELETE RESTRICT
             );
             COMMIT;
-        ")?;
-        
+        ",
+        )?;
+
         Ok(Database {
-            root, blobs,
-            conn: Mutex::new(conn)
+            root,
+            blobs,
+            conn: Mutex::new(conn),
         })
     }
-    
+
     pub fn blob_exists(&self, digest: &str) -> bool {
         self.blobs.join(digest).exists()
     }

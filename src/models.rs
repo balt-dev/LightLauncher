@@ -5,7 +5,6 @@ use std::collections::HashMap;
 
 use chrono::FixedOffset;
 
-
 /// Live status information advertised by a game server.
 #[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[allow(missing_docs)]
@@ -18,14 +17,14 @@ pub struct ServerStatus {
     pub round_id: Option<u32>,
     pub run_level: i32,
     pub panic_bunker: bool,
-    pub soft_max_players: Option<i32>
+    pub soft_max_players: Option<i32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[allow(missing_docs)]
 pub struct ServerListing {
     pub name: Option<String>,
-    pub address: String
+    pub address: String,
 }
 
 /// A normalized server-list entry returned by a hub.
@@ -42,12 +41,18 @@ pub struct ServerEntry {
 impl ServerEntry {
     /// Gets a sensible display name for the given server entry.
     pub fn display_name(&self) -> Cow<'_, str> {
-        self.listing.name.as_ref().map(|s| Cow::<'_, str>::Borrowed(&*s))
-            .or(self.status_data.name.as_ref().map(|s| Cow::<'_, str>::Borrowed(&*s)))
+        self.listing
+            .name
+            .as_ref()
+            .map(|s| Cow::<'_, str>::Borrowed(&*s))
+            .or(self
+                .status_data
+                .name
+                .as_ref()
+                .map(|s| Cow::<'_, str>::Borrowed(&*s)))
             .unwrap_or_else(|| Cow::Owned(self.listing.address.to_string()))
     }
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[allow(missing_docs)]
@@ -65,7 +70,7 @@ pub struct BuildInformation {
 #[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[allow(missing_docs)]
 pub struct AuthInformation {
-    pub public_key: Option<String>
+    pub public_key: Option<String>,
 }
 
 #[derive(Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -79,7 +84,7 @@ pub struct Account {
     #[serde(with = "crate::serde::time")]
     pub expire_time: chrono::DateTime<FixedOffset>,
     #[serde(skip)]
-    pub(crate) refreshing: bool
+    pub(crate) refreshing: bool,
 }
 
 impl std::fmt::Debug for Account {
@@ -97,23 +102,22 @@ impl std::fmt::Debug for Account {
 #[allow(missing_docs)]
 pub struct ServerInfo {
     pub build: Option<BuildInformation>,
-    pub auth: AuthInformation
+    pub auth: AuthInformation,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[allow(missing_docs)]
 pub struct ContentBundleMetadata {
     pub engine_version: String,
-    pub base_build: Option<BuildInformation>
+    pub base_build: Option<BuildInformation>,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[allow(missing_docs)]
 pub struct EnginePlatformBuild {
     pub url: String,
     pub sha256: Option<String>,
-    pub signature: Option<String>
+    pub signature: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -121,7 +125,7 @@ pub struct EnginePlatformBuild {
 pub struct EngineManifestEntry {
     pub redirect: Option<String>,
     pub insecure: bool,
-    pub platforms: HashMap<String, EnginePlatformBuild>
+    pub platforms: HashMap<String, EnginePlatformBuild>,
 }
 
 #[derive(Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -131,13 +135,13 @@ pub struct AuthRequest {
     pub password: String,
     #[serde(rename = "tfaCode")]
     #[serde(default)]
-    pub tfa_code: String
+    pub tfa_code: String,
 }
 
 #[derive(Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[allow(missing_docs)]
 pub struct RefreshRequest {
-    pub token: String
+    pub token: String,
 }
 #[derive(Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[allow(missing_docs)]
@@ -146,7 +150,7 @@ pub struct RefreshResponse {
     #[serde(with = "crate::serde::time")]
     pub expire_time: chrono::DateTime<FixedOffset>,
     #[serde(rename = "newToken")]
-    pub new_token: String
+    pub new_token: String,
 }
 
 impl std::fmt::Debug for RefreshResponse {

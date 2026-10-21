@@ -1,13 +1,13 @@
 #![warn(clippy::pedantic, clippy::perf)]
 //! A lightweight SS14 launcher.
 
-pub mod models;
+pub mod config;
+pub mod db;
 pub mod gui;
+pub mod models;
+pub mod serde;
 pub mod staticdata;
 pub mod utils;
-pub mod config;
-pub mod serde;
-pub mod db;
 pub mod worker;
 
 use std::{process::ExitCode, sync::LazyLock};
@@ -37,7 +37,9 @@ fn main() -> ExitCode {
     match res {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            log::error!("The launcher had to be closed because of an error. Please send your log to the developer!");
+            log::error!(
+                "The launcher had to be closed because of an error. Please send your log to the developer!"
+            );
             log::error!("Error: {err}");
             ExitCode::FAILURE
         }

@@ -1,12 +1,9 @@
-
-
 use std::{path::PathBuf, sync::LazyLock, time::Duration};
 
 use chrono::TimeDelta;
 use egui::{Id, LayerId, Order};
 
 use crate::db::Database;
-
 
 pub const TOKEN_REFRESH_INTERVAL: Duration = Duration::from_mins(5);
 pub const TOKEN_REFRESH_THRESHOLD: chrono::TimeDelta = TimeDelta::days(5);
@@ -18,7 +15,7 @@ pub static USER_AGENT: &'static str = concat!("LightLauncher/", env!("CARGO_PKG_
 pub struct StaticData {
     pub datapath: PathBuf,
     pub subwindow_layer: LayerId,
-    pub db: Database
+    pub db: Database,
 }
 
 pub static STATIC_DATA: LazyLock<StaticData> = LazyLock::new(|| {
@@ -28,7 +25,7 @@ pub static STATIC_DATA: LazyLock<StaticData> = LazyLock::new(|| {
     };
     let datapath = dirs.data_local_dir();
     match std::fs::create_dir_all(datapath) {
-        Ok(()) => {},
+        Ok(()) => {}
         Err(err) => {
             eprintln!("failed during init: could not create directory: {err}");
             std::process::exit(1);
@@ -43,7 +40,10 @@ pub static STATIC_DATA: LazyLock<StaticData> = LazyLock::new(|| {
     };
     StaticData {
         datapath: datapath.to_path_buf(),
-        subwindow_layer: LayerId { order: Order::Foreground, id: Id::unique("subwindow") },
-        db
+        subwindow_layer: LayerId {
+            order: Order::Foreground,
+            id: Id::unique("subwindow"),
+        },
+        db,
     }
 });
