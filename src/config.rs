@@ -53,7 +53,7 @@ impl Default for Config {
             },
             accounts: HashMap::new(),
             selected_account: None,
-            pinned_servers: vec![],
+            pinned_servers: Vec::new(),
         }
     }
 }

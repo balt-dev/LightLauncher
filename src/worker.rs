@@ -4,14 +4,11 @@ use reqwest::{
     header::{self},
 };
 use std::{
-    fmt::Display,
-    sync::mpsc::{self, Receiver, RecvError, Sender, TryRecvError},
-    thread::{self, JoinHandle},
+    collections::HashMap, fmt::Display, sync::mpsc::{self, Receiver, RecvError, Sender, TryRecvError}, thread::{self, JoinHandle},
 };
 
 use crate::{
-    models::{Account, AuthRequest, RefreshRequest, RefreshResponse},
-    staticdata::{self as s},
+    models::{Account, AuthRequest, RefreshRequest, RefreshResponse, ServerEntry}, staticdata::{self as s},
 };
 
 pub struct WorkerThread {
@@ -108,6 +105,7 @@ pub enum WorkerMessage {
     OpenFileDialog {
         target: FileDialogTarget,
     },
+    FetchServers { hub: String },
 }
 
 #[derive(Debug)]
@@ -117,6 +115,7 @@ pub enum FileDialogTarget {
 
 #[derive(Debug)]
 pub enum WorkerResponse {
+    Nop,
     Pong,
     RefreshSuccessful {
         id: String,
@@ -139,7 +138,8 @@ pub enum WorkerResponse {
         path: String,
         target: FileDialogTarget,
     },
-    Nop,
+    FetchFailure { error: anyhow::Error },
+    FetchSuccessful { servers: HashMap<String, ServerEntry> },
 }
 
 impl WorkerMessage {
@@ -212,6 +212,38 @@ impl WorkerMessage {
                     path: file.path().to_string_lossy().to_string(),
                     target,
                 })
+            }
+            WorkerMessage::FetchServers { hub } => {
+                let res = ctx
+                    .http
+                    .get(hub)
+                    .header(header::USER_AGENT, s::USER_AGENT)
+                    .timeout(s::REQUEST_TIMEOUT)
+                    .send()
+                    .await?;
+
+                let response = match res.error_for_status() {
+                    Ok(v) => v,
+                    Err(err) => {
+                        return Ok(WorkerResponse::FetchFailure {
+                            error: err.into(),
+                        });
+                    }
+                };
+                let server_list = match response.json::<Vec<ServerEntry>>().await {
+                    Ok(v) => v,
+                    Err(err) => {
+                        return Ok(WorkerResponse::FetchFailure {
+                            error: err.into(),
+                        });
+                    }
+                };
+                let mut servers = HashMap::new();
+                for server in server_list {
+                    servers.insert(server.listing.address.clone(), server);
+                }
+                log::debug!("servers: {servers:?}");
+                Ok(WorkerResponse::FetchSuccessful { servers })
             }
         }
     }

@@ -9,32 +9,50 @@ use chrono::FixedOffset;
 #[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[allow(missing_docs)]
 pub struct ServerStatus {
+    #[serde(default)]
     pub map: Option<String>,
+    #[serde(default)]
     pub name: Option<String>,
+    #[serde(default)]
     pub tags: Vec<String>,
+    #[serde(default)]
     pub preset: Option<String>,
+    #[serde(default)]
     pub players: u32,
+    #[serde(default)]
     pub round_id: Option<u32>,
+    #[serde(default)]
     pub run_level: i32,
+    #[serde(default)]
+    #[serde(with = "crate::serde::time")]
+    pub round_start_time: chrono::DateTime<FixedOffset>,
+    #[serde(default)]
     pub panic_bunker: bool,
+    #[serde(default)]
     pub soft_max_players: Option<i32>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[allow(missing_docs)]
 pub struct ServerListing {
+    #[serde(default)]
     pub name: Option<String>,
+    #[serde(default)]
     pub address: String,
 }
 
 /// A normalized server-list entry returned by a hub.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[allow(missing_docs)]
 pub struct ServerEntry {
     #[serde(flatten)]
+    #[serde(default)]
     pub listing: ServerListing,
+    #[serde(rename = "inferredTags")]
+    #[serde(default)]
     pub inferred_tags: Vec<String>,
     #[serde(rename = "statusData")]
+    #[serde(default)]
     pub status_data: ServerStatus,
 }
 
@@ -54,16 +72,24 @@ impl ServerEntry {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[allow(missing_docs)]
 pub struct BuildInformation {
+    #[serde(default)]
     pub download_url: String,
+    #[serde(default)]
     pub manifest_url: String,
+    #[serde(default)]
     pub manifest_download_url: String,
+    #[serde(default)]
     pub zip_hash: String,
+    #[serde(default)]
     pub manifest_hash: String,
+    #[serde(default)]
     pub version: String,
+    #[serde(default)]
     pub fork_id: String,
+    #[serde(default)]
     pub engine_version: String,
 }
 
@@ -101,30 +127,40 @@ impl std::fmt::Debug for Account {
 #[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[allow(missing_docs)]
 pub struct ServerInfo {
+    #[serde(default)]
     pub build: Option<BuildInformation>,
+    #[serde(default)]
     pub auth: AuthInformation,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[allow(missing_docs)]
 pub struct ContentBundleMetadata {
+    #[serde(default)]
     pub engine_version: String,
+    #[serde(default)]
     pub base_build: Option<BuildInformation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[allow(missing_docs)]
 pub struct EnginePlatformBuild {
+    #[serde(default)]
     pub url: String,
+    #[serde(default)]
     pub sha256: Option<String>,
+    #[serde(default)]
     pub signature: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[allow(missing_docs)]
 pub struct EngineManifestEntry {
+    #[serde(default)]
     pub redirect: Option<String>,
+    #[serde(default)]
     pub insecure: bool,
+    #[serde(default)]
     pub platforms: HashMap<String, EnginePlatformBuild>,
 }
 
@@ -148,8 +184,10 @@ pub struct RefreshRequest {
 pub struct RefreshResponse {
     #[serde(rename = "expireTime")]
     #[serde(with = "crate::serde::time")]
+    #[serde(default)]
     pub expire_time: chrono::DateTime<FixedOffset>,
     #[serde(rename = "newToken")]
+    #[serde(default)]
     pub new_token: String,
 }
 

@@ -1,14 +1,11 @@
-use std::time::{Duration, Instant};
+use std::{collections::HashMap, time::{Duration, Instant}};
 
 use chrono::Local;
 use egui::{Widget, Window};
 use reqwest::Url;
 
 use crate::{
-    config::Config,
-    models::{AuthRequest, RefreshRequest},
-    staticdata as s,
-    worker::{FileDialogTarget, WorkerMessage, WorkerThread},
+    config::Config, models::{AuthRequest, RefreshRequest, ServerEntry, ServerListing}, staticdata as s, worker::{FileDialogTarget, WorkerMessage, WorkerThread},
 };
 
 macro_rules! ui_try {
@@ -41,6 +38,7 @@ pub enum Subwindow {
 }
 
 pub struct App {
+    pub hub_servers: Result<Option<Vec<ServerEntry>>, anyhow::Error>,
     pub worker: WorkerThread,
     pub config: Config,
     pub tab: TabSelection,
@@ -67,6 +65,22 @@ impl eframe::App for App {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        egui::containers::Panel::bottom("bottom_nav")
+            .resizable(false)
+            .show(ui, |ui| {
+                egui::MenuBar::new().ui(ui, |ui| {
+                    if ui.button("Servers").clicked() && self.subwindow.is_none() {
+                        self.tab = TabSelection::ServerListing
+                    }
+                    if ui.button("Accounts").clicked() && self.subwindow.is_none() {
+                        self.tab = TabSelection::Accounts
+                    }
+                    if ui.button("Config").clicked() && self.subwindow.is_none() {
+                        self.tab = TabSelection::Config
+                    }
+                });
+            });
+        
         egui::CentralPanel::default().show(ui, |ui| {
             ui.vertical_centered(|ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
@@ -85,24 +99,10 @@ impl eframe::App for App {
                     self.draw_config(ui);
                 }
             }
-            egui::containers::Panel::bottom("bottom_nav")
-                .resizable(false)
-                .show(ui, |ui| {
-                    egui::MenuBar::new().ui(ui, |ui| {
-                        if ui.button("Servers").clicked() && self.subwindow.is_none() {
-                            self.tab = TabSelection::ServerListing
-                        }
-                        if ui.button("Accounts").clicked() && self.subwindow.is_none() {
-                            self.tab = TabSelection::Accounts
-                        }
-                        if ui.button("Config").clicked() && self.subwindow.is_none() {
-                            self.tab = TabSelection::Config
-                        }
-                    });
-                });
         });
 
         self.show_account_subwindow(ui);
+        self.show_direct_conn_subwindow(ui);
     }
 }
 
@@ -111,6 +111,7 @@ impl App {
         let config = Config::load()?;
         let worker = WorkerThread::init();
         Ok(Self {
+            hub_servers: Ok(None),
             worker,
             config,
             tab: TabSelection::ServerListing,
@@ -120,10 +121,31 @@ impl App {
     }
 
     fn draw_server_listing(&mut self, ui: &mut egui::Ui) {
+        for server in &self.config.pinned_servers {
+            self.draw_server(ui, server, true);
+        }
+        match &self.hub_servers {
+            Ok(None) => { ui.vertical_centered(|ui| ui.weak("Loading server list..")); },
+            Err(err) => { ui.vertical_centered(|ui| ui.weak(format!("Failed to load server list\n{err}"))); },
+            Ok(Some(servers)) => {
+                for server in servers {
+                    self.draw_server(ui, server, false);
+                }
+            }
+        }
+        
         egui::containers::Panel::bottom("server_nav")
             .resizable(false)
             .show(ui, |ui| {
+                ui.collapsing("Filters", |ui| {
+                    
+                });
+                ui.separator();
                 egui::MenuBar::new().ui(ui, |ui| {
+                    if ui.button("Refresh").clicked() && self.subwindow.is_none() {
+                        self.hub_servers = Ok(None);
+                        self.refresh_servers();
+                    }
                     if ui.button("Direct Connect/Pin").clicked() && self.subwindow.is_none() {
                         self.subwindow = Some(Subwindow::DirectConnect {
                             name: String::new(),
@@ -131,7 +153,7 @@ impl App {
                         });
                     }
                     if ui.button("Open Replay").clicked() && self.subwindow.is_none() {
-                        self.tab = TabSelection::Config
+                        // TODO
                     }
                 });
             });
@@ -306,6 +328,41 @@ impl App {
             self.subwindow = None;
         }
     }
+    
+    fn show_direct_conn_subwindow(&mut self, ui: &mut egui::Ui) {
+        let Some(Subwindow::DirectConnect {
+            name,
+            url,
+        }) = &mut self.subwindow else { return; };
+        let mut open = true;
+        Window::new("Direct Connect / Pin")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable([true, false])
+            .show(ui.ctx(), |ui| {
+                egui::Grid::new("add_account_grid")
+                    .num_columns(2)
+                    .show(ui, |ui| {
+                        ui.label("Name:");
+                        egui::TextEdit::singleline(name)
+                            .hint_text("Foobar Station")
+                            .desired_width(ui.available_width())
+                            .ui(ui);
+
+                        ui.shrink_height_to_current();
+                        ui.end_row();
+
+                        ui.label("URL:");
+                        egui::TextEdit::singleline(url)
+                            .hint_text("https://example.com:1212")
+                            .desired_width(ui.available_width())
+                            .ui(ui);
+                    });
+            });
+        if !open {
+            self.subwindow = None;
+        }
+    }
 
     fn check_worker_thread(&mut self) {
         loop {
@@ -361,6 +418,12 @@ impl App {
                     crate::worker::FileDialogTarget::LoaderPath => self.config.loader_path = path,
                 },
                 crate::worker::WorkerResponse::Nop => {}
+                crate::worker::WorkerResponse::FetchFailure { error } => {
+                    self.hub_servers = Err(error)
+                },
+                crate::worker::WorkerResponse::FetchSuccessful { servers } => {
+                    self.hub_servers = Ok(Some(servers))
+                },
             }
         }
     }
@@ -385,6 +448,15 @@ impl App {
                 });
             }
         }
+    }
+
+    fn refresh_servers(&mut self) {
+        if let Err(_) = self.hub_servers { return; }
+        if let Ok(Some(_)) = self.hub_servers { return; }
+        
+        let _ = self.worker.send(WorkerMessage::FetchServers {
+            hub: self.config.hub_url.clone()
+        });
     }
 }
 
