@@ -20,3 +20,4 @@ egui = "0.37.0"
 rusqlite = "0.40.2"
 async-compat = "0.2.6"
 blake2 = "0.11.0"
+ordered_hash_map = { version = "0.6.1", features = ["serde"] }

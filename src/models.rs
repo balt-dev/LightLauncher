@@ -1,7 +1,9 @@
 //! Contains data models for data being transmitted across the application and server.
 
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::collections::HashMap;
+use std::sync::Mutex;
 
 use chrono::FixedOffset;
 
@@ -24,12 +26,12 @@ pub struct ServerStatus {
     #[serde(default)]
     pub run_level: i32,
     #[serde(default)]
-    #[serde(with = "crate::serde::time")]
-    pub round_start_time: chrono::DateTime<FixedOffset>,
+    #[serde(with = "crate::serde::time_opt")]
+    pub round_start_time: Option<chrono::DateTime<FixedOffset>>,
     #[serde(default)]
     pub panic_bunker: bool,
     #[serde(default)]
-    pub soft_max_players: Option<i32>,
+    pub soft_max_players: Option<i32>
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -56,19 +58,15 @@ pub struct ServerEntry {
     pub status_data: ServerStatus,
 }
 
-impl ServerEntry {
+impl ServerListing {
     /// Gets a sensible display name for the given server entry.
-    pub fn display_name(&self) -> Cow<'_, str> {
-        self.listing
+    pub fn display_name<'b, 'a: 'b>(&'a self, fallback: Option<String>) -> Cow<'b, str> {
+        self
             .name
             .as_ref()
             .map(|s| Cow::<'_, str>::Borrowed(&*s))
-            .or(self
-                .status_data
-                .name
-                .as_ref()
-                .map(|s| Cow::<'_, str>::Borrowed(&*s)))
-            .unwrap_or_else(|| Cow::Owned(self.listing.address.to_string()))
+            .or(fallback.map(Cow::<'_, str>::Owned))
+            .unwrap_or_else(|| Cow::Owned(self.address.to_string()))
     }
 }
 
@@ -78,24 +76,29 @@ pub struct BuildInformation {
     #[serde(default)]
     pub download_url: String,
     #[serde(default)]
-    pub manifest_url: String,
+    pub manifest_url: Option<String>,
     #[serde(default)]
-    pub manifest_download_url: String,
+    pub manifest_download_url: Option<String>,
     #[serde(default)]
-    pub zip_hash: String,
+    pub hash: String,
     #[serde(default)]
-    pub manifest_hash: String,
+    pub manifest_hash: Option<String>,
     #[serde(default)]
     pub version: String,
     #[serde(default)]
     pub fork_id: String,
     #[serde(default)]
     pub engine_version: String,
+    #[serde(default)]
+    pub acz: bool
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[allow(missing_docs)]
 pub struct AuthInformation {
+    #[serde(default)]
+    pub mode: String,
+    #[serde(default)]
     pub public_key: Option<String>,
 }
 
@@ -131,6 +134,36 @@ pub struct ServerInfo {
     pub build: Option<BuildInformation>,
     #[serde(default)]
     pub auth: AuthInformation,
+    #[serde(default)]
+    pub links: Vec<ServerLink>,
+    #[serde(default)]
+    pub privacy_policy: Option<PrivacyPolicy>,
+    #[serde(default)]
+    pub desc: Option<String>,
+    #[serde(default)]
+    pub connect_address: Option<String>
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[allow(missing_docs)]
+pub struct PrivacyPolicy {
+    #[serde(default)]
+    pub identifier: Option<String>,
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub link: Option<String>
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[allow(missing_docs)]
+pub struct ServerLink {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub icon: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -164,7 +197,7 @@ pub struct EngineManifestEntry {
     pub platforms: HashMap<String, EnginePlatformBuild>,
 }
 
-#[derive(Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Hash)]
 #[allow(missing_docs)]
 pub struct AuthRequest {
     pub username: String,
@@ -174,7 +207,7 @@ pub struct AuthRequest {
     pub tfa_code: String,
 }
 
-#[derive(Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize,  Hash)]
 #[allow(missing_docs)]
 pub struct RefreshRequest {
     pub token: String,
@@ -215,4 +248,28 @@ impl std::fmt::Debug for RefreshRequest {
             .field("token", &..)
             .finish()
     }
+}
+
+#[derive(Default, Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum InfoStatus {
+    #[default]
+    Unfetched,
+    Fetching,
+    Fetched(ServerInfo),
+    FetchError(String)
+}
+
+#[derive(Default, Debug)]
+pub enum FetchStatus {
+    #[default]
+    Unfetched,
+    Fetching,
+    Fetched { status: ServerStatus, info: Mutex<InfoStatus> },
+    FetchError(String)
+}
+
+#[derive(Default, Debug)]
+pub struct ServerDisplay {
+    pub listing: ServerListing,
+    pub status: Mutex<FetchStatus>,
 }

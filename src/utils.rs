@@ -1,6 +1,5 @@
 use std::{
-    fs::{self, File},
-    io::Write,
+    fs::{self, File}, io::Write, sync::{Mutex, MutexGuard},
 };
 
 use chrono::Local;
@@ -46,4 +45,14 @@ pub fn setup_logger() {
         }
     }
     log::info!("logging initialized");
+}
+
+pub trait MutexExt<T> {
+    fn lock_unwrap(&self) -> MutexGuard<'_, T>;
+}
+
+impl<T> MutexExt<T> for Mutex<T> {
+    fn lock_unwrap(&self) -> MutexGuard<'_, T> {
+        self.lock().expect("other thread panicked")
+    }
 }

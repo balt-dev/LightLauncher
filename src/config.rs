@@ -3,11 +3,13 @@ use std::{
     env,
     fs::File,
     io::{self, Read, Write},
+    sync::Mutex
 };
 
+use ordered_hash_map::OrderedHashMap;
+
 use crate::{
-    models::{Account, ServerListing},
-    staticdata,
+    models::{Account, FetchStatus, ServerDisplay, ServerListing}, staticdata,
 };
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -94,5 +96,9 @@ impl Config {
             )
             .inspect_err(|e| log::warn!("failed to write config: {e}"))?;
         Ok(())
+    }
+
+    pub(crate) fn get_pinned(&self) -> OrderedHashMap<String, crate::models::ServerDisplay> {
+        self.pinned_servers.iter().map(|l| (l.address.clone(), ServerDisplay { listing: l.clone(), status: Mutex::new(FetchStatus::Unfetched) })).collect()
     }
 }

@@ -1,14 +1,15 @@
 use async_compat::Compat;
+use ordered_hash_map::OrderedHashMap;
 use reqwest::{
     Client, StatusCode,
     header::{self},
 };
 use std::{
-    collections::HashMap, fmt::Display, sync::mpsc::{self, Receiver, RecvError, Sender, TryRecvError}, thread::{self, JoinHandle},
+    collections::HashMap, fmt::Display, sync::{Mutex, mpsc::{self, Receiver, RecvError, Sender, TryRecvError}}, thread::{self, JoinHandle}, time::Duration,
 };
 
 use crate::{
-    models::{Account, AuthRequest, RefreshRequest, RefreshResponse, ServerEntry}, staticdata::{self as s},
+    models::{Account, AuthRequest, FetchStatus, RefreshRequest, RefreshResponse, ServerDisplay, ServerEntry, ServerInfo, ServerStatus}, staticdata::{self as s},
 };
 
 pub struct WorkerThread {
@@ -85,7 +86,7 @@ impl WorkerThread {
         match self.recv.try_recv() {
             Ok(val) => Ok(Some(val)),
             Err(TryRecvError::Empty) => Ok(None),
-            Err(err) => Err(err.into()),
+            Err(err) => Err(anyhow::anyhow!(err))
         }
     }
 }
@@ -106,6 +107,8 @@ pub enum WorkerMessage {
         target: FileDialogTarget,
     },
     FetchServers { hub: String },
+    FetchServerData { url: String },
+    FetchServerInfo { url: String },
 }
 
 #[derive(Debug)]
@@ -139,7 +142,11 @@ pub enum WorkerResponse {
         target: FileDialogTarget,
     },
     FetchFailure { error: anyhow::Error },
-    FetchSuccessful { servers: HashMap<String, ServerEntry> },
+    FetchSuccessful { servers: OrderedHashMap<String, ServerDisplay> },
+    StatusFetchSuccessful { url: String, status: ServerStatus },
+    StatusFetchFailure { url: String, error: anyhow::Error },
+    InfoFetchSuccessful { url: String, info: ServerInfo },
+    InfoFetchFailure { url: String, error: anyhow::Error },
 }
 
 impl WorkerMessage {
@@ -154,9 +161,9 @@ impl WorkerMessage {
                     .header(header::USER_AGENT, s::USER_AGENT)
                     .timeout(s::REQUEST_TIMEOUT)
                     .send()
-                    .await?;
+                    .await;
 
-                let response = match res.error_for_status() {
+                let response = match res.and_then(|r| r.error_for_status()) {
                     Ok(v) => v,
                     Err(err) => {
                         return Ok(WorkerResponse::LogInFailure { error: err.into() });
@@ -178,9 +185,9 @@ impl WorkerMessage {
                     .header(header::USER_AGENT, s::USER_AGENT)
                     .timeout(s::REQUEST_TIMEOUT)
                     .send()
-                    .await?;
+                    .await;
 
-                let response = match res.error_for_status() {
+                let response = match res.and_then(|r| r.error_for_status()) {
                     Ok(v) => v,
                     Err(err) if err.status() == Some(StatusCode::UNAUTHORIZED) => {
                         return Ok(WorkerResponse::RefreshExpired { id });
@@ -220,9 +227,9 @@ impl WorkerMessage {
                     .header(header::USER_AGENT, s::USER_AGENT)
                     .timeout(s::REQUEST_TIMEOUT)
                     .send()
-                    .await?;
+                    .await;
 
-                let response = match res.error_for_status() {
+                let response = match res.and_then(|r| r.error_for_status()) {
                     Ok(v) => v,
                     Err(err) => {
                         return Ok(WorkerResponse::FetchFailure {
@@ -238,13 +245,69 @@ impl WorkerMessage {
                         });
                     }
                 };
-                let mut servers = HashMap::new();
-                for server in server_list {
-                    servers.insert(server.listing.address.clone(), server);
-                }
-                log::debug!("servers: {servers:?}");
+                let mut servers = server_list.into_iter().map(|server|
+                    ServerDisplay {
+                        listing: server.listing,
+                        status:  Mutex::new(crate::models::FetchStatus::Fetched {
+                            status:server.status_data,
+                            info: Mutex::new(crate::models::InfoStatus::Unfetched)
+                        })
+                    }
+                ).collect::<Vec<_>>();
+                servers.sort_by_key(|s| s.listing.display_name(match s.status.try_lock() {
+                    Ok(lock) => match &*lock {
+                        FetchStatus::Fetched { status, .. } => status.name.clone(),
+                        _ => None
+                    },
+                    _ => None
+                }).to_string());
+                let servers = servers.into_iter().map(|s| (s.listing.address.clone(), s)).collect();
                 Ok(WorkerResponse::FetchSuccessful { servers })
             }
+            WorkerMessage::FetchServerData { url } => {
+                let res = ctx
+                    .http
+                    .get(url.replace("ss14://", "http://").replace("ss14s://", "https://").trim_suffix('/').to_owned() + "/status")
+                    .header(header::USER_AGENT, s::USER_AGENT)
+                    .timeout(s::REQUEST_TIMEOUT)
+                    .send()
+                    .await;
+                let response = match res.and_then(|r| r.error_for_status()) {
+                    Ok(v) => v,
+                    Err(error) => {
+                        return Ok(WorkerResponse::StatusFetchFailure { url, error: anyhow::anyhow!(error) });
+                    }
+                };
+                let status = match response.json::<ServerStatus>().await {
+                    Ok(v) => v,
+                    Err(error) => {
+                        return Ok(WorkerResponse::StatusFetchFailure { url, error: anyhow::anyhow!(error) });
+                    }
+                };
+                Ok(WorkerResponse::StatusFetchSuccessful { url, status })
+            },
+            WorkerMessage::FetchServerInfo { url } => {
+                let res = ctx
+                    .http
+                    .get(url.replace("ss14://", "http://").replace("ss14s://", "https://").trim_suffix('/').to_owned() + "/info")
+                    .header(header::USER_AGENT, s::USER_AGENT)
+                    .timeout(s::REQUEST_TIMEOUT)
+                    .send()
+                    .await;
+                let response = match res.and_then(|r| r.error_for_status()) {
+                    Ok(v) => v,
+                    Err(error) => {
+                        return Ok(WorkerResponse::InfoFetchFailure { url, error: anyhow::anyhow!(error) });
+                    }
+                };
+                let info = match response.json::<ServerInfo>().await {
+                    Ok(v) => v,
+                    Err(error) => {
+                        return Ok(WorkerResponse::InfoFetchFailure { url, error: anyhow::anyhow!(error) });
+                    }
+                };
+                Ok(WorkerResponse::InfoFetchSuccessful { url, info })
+            },
         }
     }
 }
