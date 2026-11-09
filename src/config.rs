@@ -3,14 +3,20 @@ use std::{
     env,
     fs::File,
     io::{self, Read, Write},
-    sync::Mutex
 };
 
-use ordered_hash_map::OrderedHashMap;
+use indexmap::IndexSet;
 
-use crate::{
-    models::{Account, FetchStatus, ServerDisplay, ServerListing}, staticdata,
-};
+use crate::{models::Account, staticdata};
+
+fn core_count() -> usize {
+    std::thread::available_parallelism().map_or(1, |c| c.get())
+}
+
+pub static DEFAULT_KEY_URL: &'static str = "https://raw.githubusercontent.com/space-wizards/SS14.Launcher/master/SS14.Launcher/signing_key";
+fn key_url() -> String {
+    DEFAULT_KEY_URL.into()
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Config {
@@ -27,7 +33,13 @@ pub struct Config {
     #[serde(default)]
     pub selected_account: Option<String>,
     #[serde(default)]
-    pub pinned_servers: Vec<ServerListing>,
+    pub pinned_servers: IndexSet<String>,
+    #[serde(default = "core_count")]
+    pub worker_threads: usize,
+    #[serde(default)]
+    pub signing_key: String,
+    #[serde(default = "key_url")]
+    pub key_url: String,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -55,7 +67,10 @@ impl Default for Config {
             },
             accounts: HashMap::new(),
             selected_account: None,
-            pinned_servers: Vec::new(),
+            pinned_servers: IndexSet::new(),
+            worker_threads: core_count(),
+            signing_key: String::new(),
+            key_url: key_url(),
         }
     }
 }
@@ -90,15 +105,11 @@ impl Config {
             .inspect_err(|e| log::warn!("failed to create config: {e}"))?;
         handle
             .write_all(
-                &serde_json::to_string(self)
+                &serde_json::to_string_pretty(self)
                     .inspect_err(|e| log::warn!("failed to save config: {e}"))?
                     .into_bytes(),
             )
             .inspect_err(|e| log::warn!("failed to write config: {e}"))?;
         Ok(())
-    }
-
-    pub(crate) fn get_pinned(&self) -> OrderedHashMap<String, crate::models::ServerDisplay> {
-        self.pinned_servers.iter().map(|l| (l.address.clone(), ServerDisplay { listing: l.clone(), status: Mutex::new(FetchStatus::Unfetched) })).collect()
     }
 }

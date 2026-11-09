@@ -8,7 +8,7 @@ use crate::db::Database;
 pub const TOKEN_REFRESH_INTERVAL: Duration = Duration::from_mins(5);
 pub const TOKEN_REFRESH_THRESHOLD: chrono::TimeDelta = TimeDelta::days(5);
 pub const AUTOSAVE_INTERVAL: std::time::Duration = Duration::from_secs(30);
-pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub static USER_AGENT: &'static str = concat!("LightLauncher/", env!("CARGO_PKG_VERSION"));
 

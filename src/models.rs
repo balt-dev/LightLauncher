@@ -3,8 +3,11 @@
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Mutex;
 
+use blake2::{Blake2b, Digest};
+use blake2::digest::consts::U32;
 use chrono::FixedOffset;
 
 /// Live status information advertised by a game server.
@@ -31,7 +34,7 @@ pub struct ServerStatus {
     #[serde(default)]
     pub panic_bunker: bool,
     #[serde(default)]
-    pub soft_max_players: Option<i32>
+    pub soft_max_players: Option<i32>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -61,8 +64,7 @@ pub struct ServerEntry {
 impl ServerListing {
     /// Gets a sensible display name for the given server entry.
     pub fn display_name<'b, 'a: 'b>(&'a self, fallback: Option<String>) -> Cow<'b, str> {
-        self
-            .name
+        self.name
             .as_ref()
             .map(|s| Cow::<'_, str>::Borrowed(&*s))
             .or(fallback.map(Cow::<'_, str>::Owned))
@@ -82,7 +84,7 @@ pub struct BuildInformation {
     #[serde(default)]
     pub hash: String,
     #[serde(default)]
-    pub manifest_hash: Option<String>,
+    pub manifest_hash: Option<Manifest>,
     #[serde(default)]
     pub version: String,
     #[serde(default)]
@@ -90,7 +92,7 @@ pub struct BuildInformation {
     #[serde(default)]
     pub engine_version: String,
     #[serde(default)]
-    pub acz: bool
+    pub acz: bool,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -141,7 +143,7 @@ pub struct ServerInfo {
     #[serde(default)]
     pub desc: Option<String>,
     #[serde(default)]
-    pub connect_address: Option<String>
+    pub connect_address: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -152,7 +154,7 @@ pub struct PrivacyPolicy {
     #[serde(default)]
     pub version: Option<String>,
     #[serde(default)]
-    pub link: Option<String>
+    pub link: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -163,7 +165,7 @@ pub struct ServerLink {
     #[serde(default)]
     pub icon: Option<String>,
     #[serde(default)]
-    pub url: Option<String>
+    pub url: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -207,7 +209,7 @@ pub struct AuthRequest {
     pub tfa_code: String,
 }
 
-#[derive(Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize,  Hash)]
+#[derive(Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Hash)]
 #[allow(missing_docs)]
 pub struct RefreshRequest {
     pub token: String,
@@ -256,7 +258,7 @@ pub enum InfoStatus {
     Unfetched,
     Fetching,
     Fetched(ServerInfo),
-    FetchError(String)
+    FetchError(String),
 }
 
 #[derive(Default, Debug)]
@@ -264,12 +266,94 @@ pub enum FetchStatus {
     #[default]
     Unfetched,
     Fetching,
-    Fetched { status: ServerStatus, info: Mutex<InfoStatus> },
-    FetchError(String)
+    Fetched {
+        status: ServerStatus,
+        info: InfoStatus,
+    },
+    FetchError(String),
 }
 
 #[derive(Default, Debug)]
 pub struct ServerDisplay {
     pub listing: ServerListing,
-    pub status: Mutex<FetchStatus>,
+    pub status: FetchStatus,
+}
+
+impl ServerDisplay {
+    pub(crate) fn display_name(&self) -> &str {
+        match &self.status {
+            FetchStatus::Fetched { status, .. } if let Some(name) = &status.name => &name,
+            _ if let Some(listname) = &self.listing.name => &listname,
+            _ => &self.listing.address,
+        }
+    }
+}
+
+#[derive(Default, Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub struct Manifest([u8; 32]);
+
+impl AsRef<[u8; 32]> for Manifest {
+    fn as_ref(&self) -> &[u8; 32] { &self.0 }
+}
+
+impl Manifest {
+    pub fn digest(data: &[u8]) -> Self {
+        let mut hasher = Blake2b::<U32>::new();
+        hasher.update(&data);
+        let digest = hasher.finalize();
+        Self(*digest.as_array().expect("U32 type should guarantee this slice is 32 bytes long"))
+    }
+}
+
+impl PartialEq<[u8]> for Manifest {
+    fn eq(&self, other: &[u8]) -> bool {
+        let Some(arr): Option<&[u8; 32]> = other.as_array() else { return false };
+        self.0.eq(arr)
+    }
+}
+
+impl std::fmt::Display for Manifest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0.iter().map(|b| format!("{b:02X}")).collect::<String>())
+    }
+}
+
+impl serde::Serialize for Manifest {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error> where S: serde::Serializer {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Manifest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error> where D: serde::Deserializer<'de> {
+        deserializer.deserialize_str(ManifestVisitor)
+    }
+}
+
+struct ManifestVisitor;
+impl<'de> serde::de::Visitor<'de> for ManifestVisitor {
+    type Value = Manifest;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "a string representing a 32-byte Blake2b hash")
+    }
+    
+    fn visit_str<E>(self, v: &str) -> Result<Self::Value, E> where E: serde::de::Error {
+        v.parse::<Manifest>().map_err(E::custom)
+    }
+}
+
+impl FromStr for Manifest {
+    type Err = anyhow::Error;
+    fn from_str(v: &str) -> Result<Self, Self::Err> {
+        if v.len() != 64 || !v.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            anyhow::bail!("invalid manifest string")
+        }
+        let mut arr = [0; 32];
+        for i in 0..32 {
+            let byte = u8::from_str_radix(&v[i * 2 .. i * 2 + 2], 16).expect("we already checked the whole string");
+            arr[i] = byte;
+        }
+        Ok(Manifest(arr))
+    }
 }

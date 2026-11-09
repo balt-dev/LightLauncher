@@ -74,13 +74,16 @@ pub mod time {
 pub mod time_opt {
     use super::*;
 
-    pub fn serialize<S>(time: &Option<chrono::DateTime<FixedOffset>>, ser: S) -> Result<S::Ok, S::Error>
+    pub fn serialize<S>(
+        time: &Option<chrono::DateTime<FixedOffset>>,
+        ser: S,
+    ) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
         match time {
             None => ser.serialize_none(),
-            Some(t) => ser.serialize_some(&t.to_rfc3339())
+            Some(t) => ser.serialize_some(&t.to_rfc3339()),
         }
     }
 
@@ -95,7 +98,7 @@ pub mod time_opt {
 
     impl<'de> Visitor<'de> for OptTimeVisitor {
         type Value = Option<chrono::DateTime<FixedOffset>>;
-        
+
         fn visit_some<D>(self, de: D) -> Result<Self::Value, D::Error>
         where
             D: Deserializer<'de>,

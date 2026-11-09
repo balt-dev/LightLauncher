@@ -1,94 +1,69 @@
 use async_compat::Compat;
-use ordered_hash_map::OrderedHashMap;
+use crossbeam_queue::SegQueue;
+use futures::stream::FuturesUnordered;
+use indexmap::IndexMap;
 use reqwest::{
-    Client, StatusCode,
-    header::{self},
+    Method, StatusCode, Url,
 };
+use smol::{Executor, Task, lock::OnceCell};
 use std::{
-    collections::HashMap, fmt::Display, sync::{Mutex, mpsc::{self, Receiver, RecvError, Sender, TryRecvError}}, thread::{self, JoinHandle}, time::Duration,
+    panic::catch_unwind,
+    sync::{
+        LazyLock,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use crate::{
-    models::{Account, AuthRequest, FetchStatus, RefreshRequest, RefreshResponse, ServerDisplay, ServerEntry, ServerInfo, ServerStatus}, staticdata::{self as s},
+    models::{
+        Account, AuthRequest, FetchStatus, RefreshRequest, RefreshResponse, ServerDisplay,
+        ServerEntry, ServerInfo, ServerStatus,
+    }, utils::{self, SerdeNever, request_bytes, request_json},
 };
 
-pub struct WorkerThread {
-    send: Sender<WorkerMessage>,
-    recv: Receiver<WorkerResponse>,
-    handle: JoinHandle<Result<!, anyhow::Error>>,
-}
+pub(crate) static EXECUTOR_THREADS: AtomicUsize = AtomicUsize::new(0);
+static EXECUTOR: OnceCell<Executor> = OnceCell::new();
+static TASKS: LazyLock<futures::stream::FuturesUnordered<Task<()>>> =
+    LazyLock::new(|| FuturesUnordered::new());
+static RESPONSES: SegQueue<WorkerResponse> = SegQueue::new();
 
-#[derive(Default)]
-pub struct WorkerContext {
-    http: Client,
-}
-
-impl WorkerThread {
-    pub fn unfuck(&mut self) -> Option<anyhow::Error> {
-        if self.handle.is_finished() {
-            let mut new = WorkerThread::init();
-            std::mem::swap(self, &mut new);
-            let Err(err) = new
-                .handle
-                .join()
-                .map_err(|e| {
-                    if let Some(str) = e.downcast_ref::<&'static str>() {
-                        anyhow::anyhow!(&**str)
-                    } else if let Some(str) = e.downcast_ref::<String>() {
-                        anyhow::anyhow!(str.clone())
-                    } else {
-                        anyhow::anyhow!("unknown")
+fn exec() -> &'static Executor<'static> {
+    EXECUTOR.get_or_init_blocking(|| {
+        let worker_count = EXECUTOR_THREADS.load(Ordering::Relaxed);
+        if worker_count == 0 {
+            panic!("tried to load executor before executor thread count was set");
+        }
+        for n in 1..=worker_count {
+            std::thread::Builder::new()
+                .name(format!("worker-{}", n))
+                .spawn(|| {
+                    loop {
+                        catch_unwind(|| smol::block_on(exec().run(smol::future::pending::<()>())))
+                            .ok();
                     }
                 })
-                .flatten();
-            Some(err)
-        } else {
-            None
+                .expect("could not spawn executor thread");
         }
-    }
+        let ex = Executor::new();
+        ex.spawn(smol::process::driver()).detach();
+        ex
+    })
+}
 
-    pub fn init() -> WorkerThread {
-        let (main_send, worker_recv) = mpsc::channel::<WorkerMessage>();
-        let (worker_send, main_recv) = mpsc::channel::<WorkerResponse>();
-        let mut worker_ctx = Default::default();
-        let handle = thread::spawn(move || -> Result<!, anyhow::Error> {
-            loop {
-                let msg = worker_recv.recv()?;
-                log::debug!("[worker] recieved message: {msg:?}");
-                match smol::block_on(Compat::new(msg.handle(&mut worker_ctx))) {
-                    Ok(response) => {
-                        log::debug!("[worker] responding: {response:?}");
-                        worker_send.send(response)?;
-                    }
-                    Err(err) => log::error!("[worker] error while handling message: {err:?}"),
-                }
+pub fn send(message: WorkerMessage) {
+    TASKS.push(exec().spawn(Compat::new(async move {
+        match message.handle().await {
+            Ok(response) => {
+                log::debug!("[worker] responding: {response:?}");
+                RESPONSES.push(response);
             }
-        });
-
-        Self {
-            handle,
-            send: main_send,
-            recv: main_recv,
+            Err(err) => log::error!("[worker] error while handling message: {err:?}"),
         }
-    }
+    })));
+}
 
-    pub fn send(&self, message: WorkerMessage) -> Result<(), anyhow::Error> {
-        match self.send.send(message) {
-            Ok(()) => Ok(()),
-            Err(err) => {
-                log::warn!("failed to send message to worker thread, did it explode? (err: {err})");
-                Err(err.into())
-            }
-        }
-    }
-
-    pub fn check_for_response(&self) -> Result<Option<WorkerResponse>, anyhow::Error> {
-        match self.recv.try_recv() {
-            Ok(val) => Ok(Some(val)),
-            Err(TryRecvError::Empty) => Ok(None),
-            Err(err) => Err(anyhow::anyhow!(err))
-        }
-    }
+pub fn check_for_response() -> Option<WorkerResponse> {
+    RESPONSES.pop()
 }
 
 #[derive(Debug)]
@@ -106,9 +81,18 @@ pub enum WorkerMessage {
     OpenFileDialog {
         target: FileDialogTarget,
     },
-    FetchServers { hub: String },
-    FetchServerData { url: String },
-    FetchServerInfo { url: String },
+    FetchServers {
+        hub: String,
+    },
+    FetchServerData {
+        url: String,
+    },
+    FetchServerInfo {
+        url: String,
+    },
+    SynchronizeSigningKey {
+        url: String,
+    },
 }
 
 #[derive(Debug)]
@@ -141,74 +125,67 @@ pub enum WorkerResponse {
         path: String,
         target: FileDialogTarget,
     },
-    FetchFailure { error: anyhow::Error },
-    FetchSuccessful { servers: OrderedHashMap<String, ServerDisplay> },
-    StatusFetchSuccessful { url: String, status: ServerStatus },
-    StatusFetchFailure { url: String, error: anyhow::Error },
-    InfoFetchSuccessful { url: String, info: ServerInfo },
-    InfoFetchFailure { url: String, error: anyhow::Error },
+    FetchFailure {
+        error: anyhow::Error,
+    },
+    FetchSuccessful {
+        servers: IndexMap<String, ServerDisplay>,
+    },
+    StatusFetchSuccessful {
+        url: String,
+        status: ServerStatus,
+    },
+    StatusFetchFailure {
+        url: String,
+        error: anyhow::Error,
+    },
+    InfoFetchSuccessful {
+        url: String,
+        info: ServerInfo,
+    },
+    InfoFetchFailure {
+        url: String,
+        error: anyhow::Error,
+    },
+    SyncKeySuccess {
+        key: String,
+    },
+    SyncKeyFailure {
+        error: anyhow::Error,
+    },
 }
 
 impl WorkerMessage {
-    async fn handle(self, ctx: &mut WorkerContext) -> Result<WorkerResponse, anyhow::Error> {
+    async fn handle(self) -> Result<WorkerResponse, anyhow::Error> {
         match self {
             WorkerMessage::Ping => Ok(WorkerResponse::Pong),
-            WorkerMessage::LogIn { auth, url } => {
-                let res = ctx
-                    .http
-                    .post(url.join("authenticate")?)
-                    .json(&auth)
-                    .header(header::USER_AGENT, s::USER_AGENT)
-                    .timeout(s::REQUEST_TIMEOUT)
-                    .send()
-                    .await;
-
-                let response = match res.and_then(|r| r.error_for_status()) {
-                    Ok(v) => v,
-                    Err(err) => {
-                        return Ok(WorkerResponse::LogInFailure { error: err.into() });
-                    }
-                };
-                let account = match response.json::<Account>().await {
-                    Ok(v) => v,
-                    Err(err) => {
-                        return Ok(WorkerResponse::LogInFailure { error: err.into() });
-                    }
-                };
-                Ok(WorkerResponse::LogInSuccessful { account })
-            }
+            WorkerMessage::LogIn { auth, url } => match request_json::<Account, AuthRequest>(
+                url.join("authenticate")?,
+                Some(auth),
+                Method::POST,
+            )
+            .await
+            {
+                Ok(account) => Ok(WorkerResponse::LogInSuccessful { account }),
+                Err(err) => Ok(WorkerResponse::LogInFailure { error: err.into() }),
+            },
             WorkerMessage::RefreshToken { id, auth, url } => {
-                let res = ctx
-                    .http
-                    .post(url.join("refresh")?)
-                    .json(&auth)
-                    .header(header::USER_AGENT, s::USER_AGENT)
-                    .timeout(s::REQUEST_TIMEOUT)
-                    .send()
-                    .await;
-
-                let response = match res.and_then(|r| r.error_for_status()) {
-                    Ok(v) => v,
-                    Err(err) if err.status() == Some(StatusCode::UNAUTHORIZED) => {
-                        return Ok(WorkerResponse::RefreshExpired { id });
+                match request_json::<RefreshResponse, RefreshRequest>(
+                    url.join("refresh")?,
+                    Some(auth),
+                    Method::POST,
+                )
+                .await
+                {
+                    Ok(refresh) => Ok(WorkerResponse::RefreshSuccessful { id, refresh }),
+                    Err(err) if let Some(StatusCode::UNAUTHORIZED) = err.status() => {
+                        Ok(WorkerResponse::RefreshExpired { id })
                     }
-                    Err(err) => {
-                        return Ok(WorkerResponse::RefreshFailure {
-                            id,
-                            error: err.into(),
-                        });
-                    }
-                };
-                let refresh = match response.json::<RefreshResponse>().await {
-                    Ok(v) => v,
-                    Err(err) => {
-                        return Ok(WorkerResponse::RefreshFailure {
-                            id,
-                            error: err.into(),
-                        });
-                    }
-                };
-                Ok(WorkerResponse::RefreshSuccessful { id, refresh })
+                    Err(err) => Ok(WorkerResponse::RefreshFailure {
+                        id,
+                        error: err.into(),
+                    }),
+                }
             }
             WorkerMessage::OpenFileDialog { target } => {
                 let dialog = rfd::AsyncFileDialog::new();
@@ -221,92 +198,93 @@ impl WorkerMessage {
                 })
             }
             WorkerMessage::FetchServers { hub } => {
-                let res = ctx
-                    .http
-                    .get(hub)
-                    .header(header::USER_AGENT, s::USER_AGENT)
-                    .timeout(s::REQUEST_TIMEOUT)
-                    .send()
-                    .await;
-
-                let response = match res.and_then(|r| r.error_for_status()) {
-                    Ok(v) => v,
-                    Err(err) => {
-                        return Ok(WorkerResponse::FetchFailure {
-                            error: err.into(),
-                        });
-                    }
+                let servers = match request_json::<Vec<ServerEntry>, SerdeNever>(
+                    Url::try_from(&*hub)?,
+                    None,
+                    Method::GET,
+                )
+                .await
+                {
+                    Ok(servers) => servers,
+                    Err(err) => return Ok(WorkerResponse::FetchFailure { error: err.into() }),
                 };
-                let server_list = match response.json::<Vec<ServerEntry>>().await {
-                    Ok(v) => v,
-                    Err(err) => {
-                        return Ok(WorkerResponse::FetchFailure {
-                            error: err.into(),
-                        });
-                    }
-                };
-                let mut servers = server_list.into_iter().map(|server|
-                    ServerDisplay {
+                let mut servers = servers
+                    .into_iter()
+                    .map(|server| ServerDisplay {
                         listing: server.listing,
-                        status:  Mutex::new(crate::models::FetchStatus::Fetched {
-                            status:server.status_data,
-                            info: Mutex::new(crate::models::InfoStatus::Unfetched)
-                        })
-                    }
-                ).collect::<Vec<_>>();
-                servers.sort_by_key(|s| s.listing.display_name(match s.status.try_lock() {
-                    Ok(lock) => match &*lock {
-                        FetchStatus::Fetched { status, .. } => status.name.clone(),
-                        _ => None
-                    },
-                    _ => None
-                }).to_string());
-                let servers = servers.into_iter().map(|s| (s.listing.address.clone(), s)).collect();
+                        status: crate::models::FetchStatus::Fetched {
+                            status: server.status_data,
+                            info: crate::models::InfoStatus::Unfetched,
+                        },
+                    })
+                    .collect::<Vec<_>>();
+                servers.sort_unstable_by_key(|s| match &s.status {
+                    FetchStatus::Fetched { status, .. } => u32::MAX - status.players,
+                    _ => u32::MAX,
+                });
+                let servers = servers
+                    .into_iter()
+                    .map(|s| (s.listing.address.clone(), s))
+                    .collect();
                 Ok(WorkerResponse::FetchSuccessful { servers })
             }
             WorkerMessage::FetchServerData { url } => {
-                let res = ctx
-                    .http
-                    .get(url.replace("ss14://", "http://").replace("ss14s://", "https://").trim_suffix('/').to_owned() + "/status")
-                    .header(header::USER_AGENT, s::USER_AGENT)
-                    .timeout(s::REQUEST_TIMEOUT)
-                    .send()
-                    .await;
-                let response = match res.and_then(|r| r.error_for_status()) {
-                    Ok(v) => v,
-                    Err(error) => {
-                        return Ok(WorkerResponse::StatusFetchFailure { url, error: anyhow::anyhow!(error) });
-                    }
-                };
-                let status = match response.json::<ServerStatus>().await {
-                    Ok(v) => v,
-                    Err(error) => {
-                        return Ok(WorkerResponse::StatusFetchFailure { url, error: anyhow::anyhow!(error) });
-                    }
-                };
-                Ok(WorkerResponse::StatusFetchSuccessful { url, status })
+                match request_json::<ServerStatus, SerdeNever>(
+                    Url::try_from(&*(utils::sanitize_url(&url) + "/status"))?,
+                    None,
+                    Method::GET,
+                )
+                .await
+                {
+                    Ok(status) => Ok(WorkerResponse::StatusFetchSuccessful { url, status }),
+                    Err(err) if err.is_builder() => Ok(WorkerResponse::StatusFetchFailure {
+                        url,
+                        error: anyhow::anyhow!("Invalid URL"),
+                    }),
+                    Err(err) if err.is_timeout() => Ok(WorkerResponse::StatusFetchFailure {
+                        url,
+                        error: anyhow::anyhow!("Request timed out"),
+                    }),
+                    Err(err) => Ok(WorkerResponse::StatusFetchFailure {
+                        url,
+                        error: err.into(),
+                    }),
+                }
+            }
+            WorkerMessage::FetchServerInfo { url } => match request_json::<ServerInfo, SerdeNever>(
+                Url::try_from(&*(utils::sanitize_url(&url) + "/info"))?,
+                None,
+                Method::GET,
+            )
+            .await
+            {
+                Ok(info) => Ok(WorkerResponse::InfoFetchSuccessful { url, info }),
+                Err(err) if err.is_builder() => Ok(WorkerResponse::InfoFetchFailure {
+                    url,
+                    error: anyhow::anyhow!("Invalid URL"),
+                }),
+                Err(err) if err.is_timeout() => Ok(WorkerResponse::InfoFetchFailure {
+                    url,
+                    error: anyhow::anyhow!("Request timed out"),
+                }),
+                Err(err) => Ok(WorkerResponse::InfoFetchFailure {
+                    url,
+                    error: err.into(),
+                }),
             },
-            WorkerMessage::FetchServerInfo { url } => {
-                let res = ctx
-                    .http
-                    .get(url.replace("ss14://", "http://").replace("ss14s://", "https://").trim_suffix('/').to_owned() + "/info")
-                    .header(header::USER_AGENT, s::USER_AGENT)
-                    .timeout(s::REQUEST_TIMEOUT)
-                    .send()
-                    .await;
-                let response = match res.and_then(|r| r.error_for_status()) {
-                    Ok(v) => v,
-                    Err(error) => {
-                        return Ok(WorkerResponse::InfoFetchFailure { url, error: anyhow::anyhow!(error) });
-                    }
-                };
-                let info = match response.json::<ServerInfo>().await {
-                    Ok(v) => v,
-                    Err(error) => {
-                        return Ok(WorkerResponse::InfoFetchFailure { url, error: anyhow::anyhow!(error) });
-                    }
-                };
-                Ok(WorkerResponse::InfoFetchSuccessful { url, info })
+            WorkerMessage::SynchronizeSigningKey { url } => match request_bytes::<SerdeNever>(
+                Url::try_from(&*utils::sanitize_url(&url))?,
+                None,
+                Method::GET,
+            )
+                .await
+                .map_err(|err| anyhow::anyhow!(err))
+                .and_then(|key| String::from_utf8(key.to_vec()).map_err(|err| anyhow::anyhow!(err)))
+            {
+                Ok(key) => Ok(WorkerResponse::SyncKeySuccess { key }),
+                Err(error) => Ok(WorkerResponse::SyncKeyFailure {
+                    error: error.into(),
+                }),
             },
         }
     }

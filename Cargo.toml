@@ -1,6 +1,6 @@
 [package]
 name = "light-launcher"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 
 [dependencies]
@@ -15,9 +15,16 @@ directories = "6.0.0"
 anyhow = "1.0.104"
 log = "0.4.34"
 simplelog = "0.12"
-egui_extras = "0.37.0"
 egui = "0.37.0"
 rusqlite = "0.40.2"
 async-compat = "0.2.6"
 blake2 = "0.11.0"
-ordered_hash_map = { version = "0.6.1", features = ["serde"] }
+indexmap = { version = "2.14.2", features = ["serde"] }
+open = "5.4.5"
+slab = "0.4.12"
+futures = "0.3.34"
+crossbeam-queue = "0.3.14"
+bytes = "1.12.1"
+ruzstd = "0.9.1"
+zip = "9.5.0"
+sha256 = { version = "1.6.0", default-features = false }

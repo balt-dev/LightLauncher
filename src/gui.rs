@@ -1,12 +1,21 @@
-use std::{collections::HashMap, panic::catch_unwind, sync::Mutex, time::{Duration, Instant}};
+use std::{
+    cell::Cell,
+    collections::HashMap,
+    sync::atomic::Ordering,
+    time::{Duration, Instant},
+};
 
 use chrono::{Local, prelude::*};
-use egui::{TextStyle::Button, Vec2, Widget, RichText, Window, collapsing_header::CollapsingState};
-use ordered_hash_map::OrderedHashMap;
+use egui::{RichText, Sense, TextStyle, Vec2, Widget, Window, collapsing_header::CollapsingState};
+use indexmap::IndexSet;
 use reqwest::Url;
 
 use crate::{
-    config::Config, models::{AuthInformation, AuthRequest, BuildInformation, FetchStatus, InfoStatus, PrivacyPolicy, RefreshRequest, ServerDisplay, ServerEntry, ServerInfo, ServerListing, ServerStatus}, staticdata as s, utils::MutexExt, worker::{FileDialogTarget, WorkerMessage, WorkerThread},
+    config::{self, Config},
+    models::*,
+    staticdata as s,
+    utils::ResultExt,
+    worker::{self, FileDialogTarget, WorkerMessage},
 };
 
 macro_rules! ui_try {
@@ -24,7 +33,21 @@ pub enum TabSelection {
     ServerListing,
     Accounts,
     Config,
-    FavoriteServers,
+}
+
+#[derive(Copy, Clone)]
+enum ServerDrawMode {
+    Hub,
+    Pinned { index: usize },
+}
+
+enum ServerOperation {
+    TogglePin { url: String },
+    MoveUp { index: usize },
+    MoveDown { index: usize },
+    FetchInfo { url: String },
+    Refresh { url: String },
+    FetchServer { url: String },
 }
 
 pub enum Subwindow {
@@ -34,19 +57,29 @@ pub enum Subwindow {
         message: String,
     },
     DirectConnect {
-        name: String,
         url: String,
     },
 }
 
+pub enum HubStatus {
+    Unfetched,
+    Fetching,
+    Ok(IndexSet<String>),
+    Error(anyhow::Error),
+}
+
 pub struct App {
-    pub pinned_servers: OrderedHashMap<String, ServerDisplay>,
-    pub hub_servers: Result<Option<OrderedHashMap<String, ServerDisplay>>, anyhow::Error>,
-    pub worker: WorkerThread,
+    pub server_displays: HashMap<String, ServerDisplay>,
+    pub hub_servers: HubStatus,
     pub config: Config,
     pub tab: TabSelection,
     pub subwindow: Option<Subwindow>,
-    pub last_refresh: Instant
+    pub last_refresh: Instant,
+    queued_server_operation: Cell<Option<ServerOperation>>,
+    search_text: String,
+    tag_whitelist: String,
+    tag_blacklist: String,
+    sync_error: Option<String>,
 }
 
 impl eframe::App for App {
@@ -58,13 +91,15 @@ impl eframe::App for App {
         let _ = self.config.save();
     }
 
-    fn logic(&mut self, _ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if let Some(err) = self.worker.unfuck() {
-            log::error!("worker thread exploded: {err}");
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if let HubStatus::Unfetched = self.hub_servers {
+            self.refresh_servers();
         }
-
+        self.handle_server_op();
         self.refresh_tokens();
         self.check_worker_thread();
+
+        ctx.request_repaint();
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -72,9 +107,6 @@ impl eframe::App for App {
             .resizable(false)
             .show(ui, |ui| {
                 egui::MenuBar::new().ui(ui, |ui| {
-                    if ui.button("Favorites").clicked() && self.subwindow.is_none() {
-                        self.tab = TabSelection::FavoriteServers
-                    }
                     if ui.button("Servers").clicked() && self.subwindow.is_none() {
                         self.tab = TabSelection::ServerListing
                     }
@@ -86,7 +118,7 @@ impl eframe::App for App {
                     }
                 });
             });
-        
+
         egui::CentralPanel::default().show(ui, |ui| {
             ui.vertical_centered(|ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
@@ -104,67 +136,115 @@ impl eframe::App for App {
                 TabSelection::Config => {
                     self.draw_config(ui);
                 }
-                TabSelection::FavoriteServers => {
-                    self.draw_favorite_servers(ui);
-                }
             }
         });
 
         self.show_account_subwindow(ui);
         self.show_direct_conn_subwindow(ui);
+        self.handle_server_op();
     }
 }
 
 impl App {
-    pub fn new() -> Result<Self, anyhow::Error> {
-        let config = Config::load()?;
-        let worker = WorkerThread::init();
+    pub fn new(config: Config) -> Result<Self, anyhow::Error> {
+        worker::EXECUTOR_THREADS.store(config.worker_threads, Ordering::Relaxed);
+        worker::send(WorkerMessage::SynchronizeSigningKey {
+            url: config.key_url.clone(),
+        });
         Ok(Self {
-            pinned_servers: config.get_pinned(),
-            hub_servers: Ok(None),
-            worker,
+            server_displays: HashMap::new(),
+            hub_servers: HubStatus::Unfetched,
             config,
             tab: TabSelection::ServerListing,
             subwindow: None,
-            last_refresh: Instant::now() - Duration::from_secs(1000)
+            last_refresh: Instant::now() - Duration::from_secs(1000),
+            queued_server_operation: Cell::new(None),
+            search_text: String::new(),
+            tag_whitelist: String::new(),
+            tag_blacklist: String::new(),
+            sync_error: None,
         })
     }
 
     fn draw_server_listing(&mut self, ui: &mut egui::Ui) {
-        match &self.hub_servers {
-            Ok(None) => { ui.vertical_centered(|ui| ui.weak("Loading server list..")); },
-            Err(err) => { ui.vertical_centered(|ui| ui.weak(format!("Failed to load server list\n{err}"))); },
-            Ok(Some(servers)) => {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    for server in servers.values() {
-                        self.draw_server(ui, server);
-                    }
-                });
-            }
-        }
-        
+        ui.heading("Servers");
+        ui.separator();
         egui::containers::Panel::bottom("server_nav")
             .resizable(false)
             .show(ui, |ui| {
-                ui.collapsing("Filters", |ui| {
-                    
+                ui.horizontal(|ui| {
+                    ui.label("Search");
+                    egui::TextEdit::singleline(&mut self.search_text)
+                        .hint_text("wiz east")
+                        .desired_width(ui.available_width())
+                        .ui(ui);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Tag Whitelist");
+                    egui::TextEdit::singleline(&mut self.tag_whitelist)
+                        .hint_text("lang:en rp:med rp:high")
+                        .desired_width(ui.available_width())
+                        .ui(ui);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Tag Blacklist");
+                    egui::TextEdit::singleline(&mut self.tag_blacklist)
+                        .hint_text("18+ region:luna")
+                        .desired_width(ui.available_width())
+                        .ui(ui);
                 });
                 ui.separator();
                 egui::MenuBar::new().ui(ui, |ui| {
                     if ui.button("Refresh").clicked() && self.subwindow.is_none() {
-                        self.hub_servers = Ok(None);
-                        self.refresh_servers();
+                        self.hub_servers = HubStatus::Unfetched;
                     }
                     if ui.button("Direct Connect/Pin").clicked() && self.subwindow.is_none() {
-                        self.subwindow = Some(Subwindow::DirectConnect {
-                            name: String::new(),
-                            url: String::new(),
-                        });
+                        self.subwindow = Some(Subwindow::DirectConnect { url: String::new() });
                     }
                     if ui.button("Open Replay").clicked() && self.subwindow.is_none() {
                         // TODO
                     }
                 });
+            });
+
+        egui::ScrollArea::vertical()
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+            .show(ui, |ui| {
+                let mut any_pinned_drawn = false;
+                for i in 0..self.config.pinned_servers.len() {
+                    let Some(server) = self.config.pinned_servers.get_index(i) else {
+                        continue;
+                    };
+                    any_pinned_drawn |=
+                        self.draw_server(ui, &server.clone(), ServerDrawMode::Pinned { index: i });
+                }
+                if any_pinned_drawn {
+                    ui.separator();
+                }
+                match &mut self.hub_servers {
+                    HubStatus::Unfetched | HubStatus::Fetching => {
+                        ui.vertical_centered(|ui| ui.weak("Loading hub server list.."));
+                    }
+                    HubStatus::Error(err) => {
+                        ui.vertical_centered(|ui| {
+                            ui.weak(format!("Failed to load hub server list\n{err}"))
+                        });
+                    }
+                    HubStatus::Ok(servers) => {
+                        if servers.is_empty() {
+                            ui.vertical_centered(|ui| {
+                                ui.weak("No servers were returned from the configured hub.")
+                            });
+                            ui.vertical_centered(|ui| ui.weak("Check you're using the right one."));
+                        }
+                        for server in servers.clone() {
+                            if self.config.pinned_servers.contains(&server) {
+                                continue;
+                            }
+                            self.draw_server(ui, &server, ServerDrawMode::Hub);
+                        }
+                    }
+                }
             });
     }
 
@@ -204,17 +284,20 @@ impl App {
         for user_id in to_remove {
             self.config.accounts.remove(&user_id);
         }
-        if ui.button("Add an account...").clicked() && self.subwindow.is_none() {
-            self.subwindow = Some(Subwindow::AddAccount {
-                auth: Default::default(),
-                show_password: false,
-                message: String::new(),
-            });
-        }
-        if ui.button("Refresh").clicked() && self.subwindow.is_none() {
-            self.last_refresh = Instant::now() - s::TOKEN_REFRESH_INTERVAL * 100;
-            self.refresh_tokens();
-        }
+        ui.separator();
+        ui.horizontal(|ui| {
+            if ui.button("Add an account...").clicked() && self.subwindow.is_none() {
+                self.subwindow = Some(Subwindow::AddAccount {
+                    auth: Default::default(),
+                    show_password: false,
+                    message: String::new(),
+                });
+            }
+            if ui.button("Refresh").clicked() && self.subwindow.is_none() {
+                self.last_refresh = Instant::now() - s::TOKEN_REFRESH_INTERVAL * 100;
+                self.refresh_tokens();
+            }
+        });
     }
 
     fn draw_config(&mut self, ui: &mut egui::Ui) {
@@ -251,7 +334,7 @@ impl App {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let response = ui.button("Browse...");
                     if response.clicked() {
-                        let _ = self.worker.send(WorkerMessage::OpenFileDialog {
+                        worker::send(WorkerMessage::OpenFileDialog {
                             target: FileDialogTarget::LoaderPath,
                         });
                     }
@@ -261,7 +344,56 @@ impl App {
                         .ui(ui);
                 });
                 ui.end_row();
+
+                let label = ui.label("Background Thread Count:");
+                if label.hovered() {
+                    label.show_tooltip_text(
+                        "\
+                        The amount of background threads handling things like web requests.\n\
+                        You must restart the launcher before changes to this apply.\
+                    ",
+                    );
+                }
+                ui.add(
+                    egui::Slider::new(&mut self.config.worker_threads, 1..=16).suffix(" threads"),
+                );
+                ui.end_row();
             });
+
+        ui.label("Signing Key");
+        egui::TextEdit::multiline(&mut self.config.signing_key)
+            .font(egui::FontId::monospace(13.0))
+            .hint_text(
+                RichText::new(
+                    "\
+                -----BEGIN PUBLIC KEY-----\n\
+                ????????\n\
+                -----END PUBLIC KEY-----\
+            ",
+                )
+                .monospace(),
+            )
+            .desired_width(ui.available_width())
+            .ui(ui);
+
+        egui::Grid::new("sync_grid").num_columns(2).show(ui, |ui| {
+            let response = ui.button("Sync to:");
+            if response.clicked() {
+                worker::send(WorkerMessage::SynchronizeSigningKey {
+                    url: self.config.key_url.clone(),
+                });
+            }
+            egui::TextEdit::singleline(&mut self.config.key_url)
+                .hint_text(config::DEFAULT_KEY_URL)
+                .desired_width(ui.available_width())
+                .ui(ui);
+        });
+        if let Some(msg) = &self.sync_error {
+            ui.label(format!("Failed to synchronize signing key:\n{msg}"));
+            if ui.button("Ok").clicked() {
+                self.sync_error = None
+            }
+        }
     }
 
     fn show_account_subwindow(&mut self, ui: &mut egui::Ui) {
@@ -325,10 +457,10 @@ impl App {
                             *message = "The auth URL is malformed. Check your config.".into();
                             return;
                         };
-                        ui_try!(self.worker.send(WorkerMessage::LogIn {
+                        worker::send(WorkerMessage::LogIn {
                             auth: auth.clone(),
-                            url
-                        }));
+                            url,
+                        });
                         *message = "Logging in...".into();
                     }
                 });
@@ -337,36 +469,41 @@ impl App {
             self.subwindow = None;
         }
     }
-    
+
     fn show_direct_conn_subwindow(&mut self, ui: &mut egui::Ui) {
-        let Some(Subwindow::DirectConnect {
-            name,
-            url,
-        }) = &mut self.subwindow else { return; };
+        let Some(Subwindow::DirectConnect { .. }) = self.subwindow else {
+            return;
+        };
         let mut open = true;
         Window::new("Direct Connect / Pin")
             .open(&mut open)
             .collapsible(false)
             .resizable([true, false])
             .show(ui.ctx(), |ui| {
-                egui::Grid::new("add_account_grid")
+                egui::Grid::new("connect_grid")
                     .num_columns(2)
                     .show(ui, |ui| {
-                        ui.label("Name:");
-                        egui::TextEdit::singleline(name)
-                            .hint_text("Foobar Station")
-                            .desired_width(ui.available_width())
-                            .ui(ui);
-
-                        ui.shrink_height_to_current();
-                        ui.end_row();
-
+                        let Some(Subwindow::DirectConnect { url }) = &mut self.subwindow else {
+                            return;
+                        };
                         ui.label("URL:");
                         egui::TextEdit::singleline(url)
-                            .hint_text("https://example.com:1212")
+                            .hint_text("ss14://example.com:1212")
                             .desired_width(ui.available_width())
                             .ui(ui);
                     });
+                ui.horizontal(|ui| {
+                    let Some(Subwindow::DirectConnect { url }) = &self.subwindow else {
+                        return;
+                    };
+                    if ui.button("Connect").clicked() {
+                        self.connect_to_server(&url);
+                    }
+                    if ui.button("Pin").clicked() {
+                        self.queue_op(ServerOperation::TogglePin { url: url.clone() });
+                        self.subwindow = None;
+                    }
+                })
             });
         if !open {
             self.subwindow = None;
@@ -375,15 +512,9 @@ impl App {
 
     fn check_worker_thread(&mut self) {
         loop {
-            let res = match self.worker.check_for_response() {
-                Ok(Some(res)) => res,
-                Ok(None) => return,
-                Err(err) => {
-                    log::error!("failed to get worker thread messages: {err}");
-                    return;
-                }
+            let Some(res) = worker::check_for_response() else {
+                return;
             };
-            log::debug!("got response: {res:?}");
 
             match res {
                 crate::worker::WorkerResponse::Pong => log::debug!("pong"),
@@ -428,33 +559,64 @@ impl App {
                 },
                 crate::worker::WorkerResponse::Nop => {}
                 crate::worker::WorkerResponse::FetchFailure { error } => {
-                    self.hub_servers = Err(error)
-                },
+                    self.hub_servers = HubStatus::Error(error)
+                }
                 crate::worker::WorkerResponse::FetchSuccessful { servers } => {
-                    self.hub_servers = Ok(Some(servers))
-                },
+                    let mut hub = IndexSet::new();
+                    for (url, server) in servers {
+                        hub.insert(url.clone());
+                        self.server_displays.insert(url, server);
+                    }
+                    self.hub_servers = HubStatus::Ok(hub)
+                }
                 crate::worker::WorkerResponse::StatusFetchSuccessful { url, status } => {
-                    let Ok(Some(servers)) = &mut self.hub_servers else { return };
-                    let Some(server) = servers.get_mut(&url) else { return };
-                    *server.status.lock_unwrap() = FetchStatus::Fetched { status, info: Mutex::new(InfoStatus::Unfetched) }
-                },
+                    let Some(server) = self.get_server_display_mut(&url) else {
+                        log::warn!("fetched bad url: {url}");
+                        return;
+                    };
+                    server.status = FetchStatus::Fetched {
+                        status,
+                        info: InfoStatus::Unfetched,
+                    }
+                }
                 crate::worker::WorkerResponse::StatusFetchFailure { url, error } => {
-                    let Ok(Some(servers)) = &mut self.hub_servers else { return };
-                    let Some(server) = servers.get_mut(&url) else { return };
-                    *server.status.lock_unwrap() = FetchStatus::FetchError(error.to_string());
-                },
+                    let Some(server) = self.get_server_display_mut(&url) else {
+                        return;
+                    };
+                    server.status = FetchStatus::FetchError(error.to_string());
+                }
                 crate::worker::WorkerResponse::InfoFetchSuccessful { url, info } => {
-                    let Ok(Some(servers)) = &mut self.hub_servers else { return };
-                    let Some(server) = servers.get_mut(&url) else { return };
-                    let FetchStatus::Fetched { info: server_info, .. } = &mut *server.status.lock_unwrap() else { return };
-                    *server_info.lock_unwrap() = InfoStatus::Fetched(info);
-                },
+                    let Some(server) = self.get_server_display_mut(&url) else {
+                        log::warn!("fetched bad url: {url}");
+                        return;
+                    };
+                    let FetchStatus::Fetched {
+                        info: server_info, ..
+                    } = &mut server.status
+                    else {
+                        return;
+                    };
+                    *server_info = InfoStatus::Fetched(info);
+                }
                 crate::worker::WorkerResponse::InfoFetchFailure { url, error } => {
-                    let Ok(Some(servers)) = &mut self.hub_servers else { return };
-                    let Some(server) = servers.get_mut(&url) else { return };
-                    let FetchStatus::Fetched { info: server_info, .. } = &mut *server.status.lock_unwrap() else { return };
-                    *server_info.lock_unwrap() = InfoStatus::FetchError(error.to_string());
-                },
+                    let Some(server) = self.get_server_display_mut(&url) else {
+                        return;
+                    };
+                    let FetchStatus::Fetched {
+                        info: server_info, ..
+                    } = &mut server.status
+                    else {
+                        return;
+                    };
+                    *server_info = InfoStatus::FetchError(error.to_string());
+                }
+                worker::WorkerResponse::SyncKeySuccess { key } => {
+                    self.sync_error = None;
+                    self.config.signing_key = key
+                }
+                worker::WorkerResponse::SyncKeyFailure { error } => {
+                    self.sync_error = Some(error.to_string());
+                }
             }
         }
     }
@@ -470,7 +632,7 @@ impl App {
                 let Ok(url) = parse_dir_url(&self.config.auth_url) else {
                     return;
                 };
-                let _ = self.worker.send(WorkerMessage::RefreshToken {
+                worker::send(WorkerMessage::RefreshToken {
                     id: account.user_id.clone(),
                     auth: RefreshRequest {
                         token: account.token.clone(),
@@ -480,57 +642,30 @@ impl App {
             }
         }
     }
-    
+
     fn refresh_servers(&mut self) {
-        if let Err(_) = self.hub_servers { return; }
-        if let Ok(Some(_)) = self.hub_servers { return; }
-        
-        let _ = self.worker.send(WorkerMessage::FetchServers {
-            hub: self.config.hub_url.clone()
+        self.hub_servers = HubStatus::Fetching;
+
+        worker::send(WorkerMessage::FetchServers {
+            hub: self.config.hub_url.clone(),
         });
     }
-    
-    fn draw_favorite_servers(&self, ui: &mut egui::Ui) {
-        self.draw_server(ui, &ServerDisplay {
-            listing: ServerListing { name: Some("Foobar Station".into()), address: "example.com".into() },
-            status: Mutex::new(FetchStatus::Fetched{
-                status: ServerStatus {
-                    map: Some("Lobber".into()),
-                    name: Some("foobar-station".into()),
-                    tags: vec!["tag-1".into(), "tag-2".into()],
-                    preset: Some("AllAtOnce".into()),
-                    players: 10,
-                    round_id: Some(1234),
-                    run_level: 1,
-                    round_start_time: None,
-                    panic_bunker: true,
-                    soft_max_players: Some(20),
-                },
-                info: Mutex::new(InfoStatus::Fetched(ServerInfo {
-                    build: None,
-                    auth: AuthInformation::default(),
-                    links: vec![],
-                    desc: Some("Just another server, don't mind me!".into()),
-                    connect_address: Some("udp://0.0.0.0:1212".into()),
-                    privacy_policy: Some(PrivacyPolicy::default())
-                }))
-            })
-        })
-    }
 
-    fn draw_server(&self, ui: &mut egui::Ui, server: &ServerDisplay) {
+    fn draw_server(&self, ui: &mut egui::Ui, url: &str, mode: ServerDrawMode) -> bool {
+        let Some(server) = self.get_server_display(url) else {
+            return false;
+        };
         let id = ui.make_persistent_id(&server.listing.address);
         let mut header_clicked = false;
-        let server_status = &mut *server.status.lock_unwrap();
-        let name = match server_status {
-            FetchStatus::Fetched { status, .. } => status.name.clone(),
-            _ => None,
-        };
-        let mut header = CollapsingState::load_with_default_open(ui.ctx(), id, false)
-            .show_header(ui, |ui| {
+        let mut header =
+            CollapsingState::load_with_default_open(ui.ctx(), id, false).show_header(ui, |ui| {
                 let start = ui.cursor();
-                if start.top() > ui.viewport_rect().height() { return; }
-                if start.bottom() < 0.0 { return; }
+                if start.top() > ui.viewport_rect().height() {
+                    return;
+                }
+                if start.bottom() < 0.0 {
+                    return;
+                }
                 let resp = {
                     let size: Vec2 = [ui.viewport_rect().width(), start.size().y].into();
                     let mut rect = ui.cursor();
@@ -543,99 +678,372 @@ impl App {
                 };
                 header_clicked = resp.clicked();
                 ui.columns_const(|[c1, c2]| {
-                    c1.add(egui::Label::new(server.listing.display_name(name)).truncate().selectable(false));
+                    let mut rt = RichText::new(server.display_name());
+                    if let ServerDrawMode::Pinned { .. } = mode {
+                        rt = rt.strong()
+                    }
+                    c1.add(egui::Label::new(rt).truncate().selectable(false));
                     c2.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.add_enabled_ui(matches!(server_status, FetchStatus::Fetched { .. }), |ui| if egui::Button::new(egui::RichText::new("Connect")).ui(ui).clicked() {
-                            log::info!("connecting to server");
-                            // TODO
-                        });
-                        match server_status {
-                            crate::models::FetchStatus::Unfetched => {
-                                *server_status = crate::models::FetchStatus::Fetching;
-                                let _ = self.worker.send(WorkerMessage::FetchServerData { url: server.listing.address.clone() });
-                            },
-                            crate::models::FetchStatus::Fetching => {
-                                ui.add(egui::Label::new(RichText::new("Fetching status...")));
-                            },
-                            crate::models::FetchStatus::Fetched { status, .. } => {
-                                ui.add(egui::Label::new(
-                                    RichText::new(format!("{} / {}", status.players, status.soft_max_players.unwrap_or(0))).weak()
-                                ).truncate().selectable(false));
-                                ui.separator();
-                                ui.add(egui::Label::new(
-                                    RichText::new(status.round_start_time.map_or("Lobby".into(), format_round_time)).weak()
-                                ).truncate().selectable(false));
-                            },
-                            crate::models::FetchStatus::FetchError(_) => {
-                                ui.add(egui::Label::new(
-                                    RichText::new("Offline").weak()
-                                ).truncate().selectable(false));
+                        ui.add_enabled_ui(!matches!(server.status, FetchStatus::Fetching), |ui| {
+                            if egui::Button::new(egui::RichText::new("⟳")).ui(ui).clicked() {
+                                log::info!("refreshing server {}", server.listing.address);
+                                self.queue_op(ServerOperation::Refresh {
+                                    url: server.listing.address.clone(),
+                                });
                             }
-                        }
+                        });
+                        ui.add_enabled_ui(
+                            matches!(server.status, FetchStatus::Fetched { .. }),
+                            |ui| {
+                                if egui::Button::new(egui::RichText::new("Connect"))
+                                    .ui(ui)
+                                    .clicked()
+                                {
+                                    self.connect_to_server(&server.listing.address);
+                                }
+                            },
+                        );
+                        ui.separator();
+                        ui.scope(|ui| {
+                            ui.set_width(180.0);
+                            let format_pin = |rt: RichText| match mode {
+                                ServerDrawMode::Hub => rt.weak(),
+                                ServerDrawMode::Pinned { .. } => rt,
+                            };
+                            match &server.status {
+                                crate::models::FetchStatus::Unfetched => {
+                                    self.queue_op(ServerOperation::FetchServer {
+                                        url: server.listing.address.clone(),
+                                    });
+                                }
+                                crate::models::FetchStatus::Fetching => {
+                                    ui.vertical_centered(|ui| {
+                                        ui.add(
+                                            egui::Label::new(format_pin(RichText::new(
+                                                "Fetching status...",
+                                            )))
+                                            .truncate()
+                                            .selectable(false),
+                                        );
+                                    });
+                                }
+                                crate::models::FetchStatus::Fetched { status, .. } => {
+                                    ui.scope(|ui| {
+                                        ui.set_width(70.0);
+                                        ui.add(
+                                            egui::Label::new(format_pin(RichText::new(format!(
+                                                "{} / {}",
+                                                status.players,
+                                                status.soft_max_players.unwrap_or(0)
+                                            ))))
+                                            .truncate()
+                                            .selectable(false),
+                                        )
+                                    });
+                                    ui.separator();
+                                    ui.scope(|ui| {
+                                        ui.set_width(70.0);
+                                        ui.add(
+                                            egui::Label::new(format_pin(RichText::new(
+                                                status
+                                                    .round_start_time
+                                                    .map_or("Lobby".into(), format_round_time),
+                                            )))
+                                            .truncate()
+                                            .selectable(false),
+                                        )
+                                    });
+                                }
+                                crate::models::FetchStatus::FetchError(_) => {
+                                    ui.vertical_centered(|ui| {
+                                        ui.add(
+                                            egui::Label::new(format_pin(RichText::new("Offline")))
+                                                .truncate()
+                                                .selectable(false),
+                                        );
+                                    });
+                                }
+                            }
+                        });
+                        ui.separator();
                     });
                 });
             });
         header.set_open(header.is_open() ^ header_clicked);
-        header.body(|ui| {
-                match server_status {
-                    crate::models::FetchStatus::Unfetched => {
-                    },
-                    crate::models::FetchStatus::Fetching => {
-                    },
-                    crate::models::FetchStatus::Fetched { status, info } => {
-                        ui.horizontal(|ui| {
-                            if let Some(id) = status.round_id {
-                                ui.add(egui::Label::new(
-                                    RichText::new(format!("Round #{}", id)).weak()
-                                ).selectable(false));
-                            } else {
-                                ui.add(egui::Label::new(
-                                    RichText::new("In lobby").weak()
-                                ).selectable(false));
-                            }
-                            if let Some(map) = &status.map {
-                                ui.separator();
-                                ui.add(egui::Label::new(
-                                    RichText::new(format!("Map: {}", map)).weak()
-                                ).selectable(false));
-                            }
-                            if let Some(preset) = &status.preset {
-                                ui.separator();
-                                ui.add(egui::Label::new(
-                                    RichText::new(format!("Preset: {}", preset)).weak()
-                                ).selectable(false));
-                            }
-                            if status.panic_bunker {
-                                ui.separator();
-                                ui.add(egui::Label::new(
-                                    RichText::new("Panic bunker enabled").weak()
-                                ).selectable(false));
-                            }
+        let server = &*server;
+        header.body(|ui| match &server.status {
+            crate::models::FetchStatus::Unfetched | crate::models::FetchStatus::Fetching => {
+                ui.add(egui::Label::new(RichText::new("Fetching info...")));
+            }
+            crate::models::FetchStatus::Fetched { status, info } => {
+                self.draw_server_top_bar(ui, &status, mode, &server.listing);
+                ui.separator();
+                match info {
+                    crate::models::InfoStatus::Unfetched => {
+                        self.queue_op(ServerOperation::FetchInfo {
+                            url: server.listing.address.clone(),
                         });
-                        let info_status = &mut *info.lock_unwrap();
-                        match info_status {
-                            crate::models::InfoStatus::Unfetched => {
-                                *info_status = crate::models::InfoStatus::Fetching;
-                                let _ = self.worker.send(WorkerMessage::FetchServerInfo { url: server.listing.address.clone() });
-                            },
-                            crate::models::InfoStatus::Fetching => {
-                                ui.add(egui::Label::new(RichText::new("Fetching info...")));
-                            },
-                            crate::models::InfoStatus::Fetched(info) => {
-                                ui.weak("TODO: add other server info here");
-                                
-                                ui.add(egui::Label::new(RichText::new(info.desc.as_ref().map(|s| &**s).unwrap_or("No description set."))));
-                            },
-                            crate::models::InfoStatus::FetchError(err) => {
-                                ui.add(egui::Label::new(RichText::new(format!("Failed to fetch info:\n{err}"))));
-                            },
-                        }
-                    },
-                    crate::models::FetchStatus::FetchError(err) => {
-                        ui.add(egui::Label::new(RichText::new(format!("Failed to connect to server:\n{err}"))));
-                    },
+                        ui.add(egui::Label::new(RichText::new("Fetching info...")));
+                    }
+                    crate::models::InfoStatus::Fetching => {
+                        ui.add(egui::Label::new(RichText::new("Fetching info...")));
+                    }
+                    crate::models::InfoStatus::Fetched(info) => {
+                        self.draw_server_info(ui, &info, &status);
+                    }
+                    crate::models::InfoStatus::FetchError(err) => {
+                        ui.add(egui::Label::new(RichText::new(format!(
+                            "Failed to fetch info:\n{err}"
+                        ))));
+                    }
+                }
+            }
+            crate::models::FetchStatus::FetchError(err) => {
+                self.draw_server_buttons(ui, mode, &server.listing);
+                ui.add(egui::Label::new(RichText::new(format!(
+                    "Failed to connect to server:\n{err}"
+                ))));
+            }
+        });
+        true
+    }
+
+    fn draw_server_top_bar(
+        &self,
+        ui: &mut egui::Ui,
+        status: &ServerStatus,
+        mode: ServerDrawMode,
+        listing: &ServerListing,
+    ) {
+        ui.columns_const(|[c1, c2]| {
+            c1.set_max_height(20.0);
+            c1.horizontal(|ui| {
+                if let Some(id) = status.round_id {
+                    ui.add(
+                        egui::Label::new(RichText::new(format!("Round #{}", id)).weak())
+                            .selectable(false),
+                    );
+                } else {
+                    ui.add(egui::Label::new(RichText::new("In lobby").weak()).selectable(false));
+                }
+                if let Some(map) = &status.map {
+                    ui.separator();
+                    ui.add(
+                        egui::Label::new(RichText::new(format!("Map: {}", map)).weak())
+                            .selectable(false),
+                    );
+                }
+                if let Some(preset) = &status.preset {
+                    ui.separator();
+                    ui.add(
+                        egui::Label::new(RichText::new(format!("Preset: {}", preset)).weak())
+                            .selectable(false),
+                    );
+                }
+                if status.panic_bunker {
+                    ui.separator();
+                    ui.add(
+                        egui::Label::new(RichText::new("Panic bunker enabled").weak())
+                            .selectable(false),
+                    );
                 }
             });
+
+            self.draw_server_buttons(c2, mode, listing);
+        });
+    }
+
+    fn draw_server_info(&self, ui: &mut egui::Ui, info: &ServerInfo, status: &ServerStatus) {
+        ui.add(egui::Label::new(RichText::new(
+            info.desc
+                .as_ref()
+                .map(|s| &**s)
+                .unwrap_or("No description set."),
+        )));
+
+        let mut tag_iter = status.tags.iter();
+        if let Some(first_tag) = tag_iter.next() {
+            ui.collapsing(RichText::new("Tags").weak(), |ui| {
+                ui.horizontal(|ui| {
+                    ui.weak(first_tag);
+                    for tag in tag_iter {
+                        ui.weak(tag);
+                    }
+                });
+            });
+        }
+
+        ui.separator();
+
+        // nav buttons
+        ui.horizontal(|ui| {
+            if let Some(privacy) = &info.privacy_policy
+                && let Some(link) = &privacy.link
+            {
+                if ui.button("Privacy Policy").clicked() {
+                    let _ = open::that_detached(link).warn_for_error();
+                }
+            }
+            for link in &info.links {
+                let ServerLink {
+                    name: Some(name),
+                    url: Some(link),
+                    ..
+                } = link
+                else {
+                    continue;
+                };
+                if ui.button(name).clicked() {
+                    let _ = open::that_detached(link).warn_for_error();
+                }
+            }
+        });
+    }
+
+    fn queue_op(&self, op: ServerOperation) {
+        self.queued_server_operation.set(Some(op));
+    }
+
+    fn matches_search(&self, server: &ServerDisplay) -> bool {
+        // todo: cache the shit outta this
+
+        let words = self.search_text.to_lowercase();
+        let mut words = words.split_ascii_whitespace();
+        let display_name = server.display_name().to_lowercase();
+        if !words.all(|word| display_name.contains(word)) {
+            return false;
+        }
+
+        if let FetchStatus::Fetched { status, .. } = &server.status {
+            let good_tag_list = self.tag_whitelist.trim_ascii().to_lowercase();
+            let bad_tag_list = self.tag_blacklist.trim_ascii().to_lowercase();
+            let good_tags = good_tag_list.split_ascii_whitespace().collect::<Vec<_>>();
+            let bad_tags = bad_tag_list.split_ascii_whitespace().collect::<Vec<_>>();
+            if good_tag_list != ""
+                && status.tags.iter().all(|haystack| {
+                    good_tags.iter().all(|needle| !haystack.contains(needle))
+                        || bad_tag_list != ""
+                            && status.tags.iter().any(|haystack| {
+                                bad_tags.iter().any(|needle| haystack.contains(needle))
+                            })
+                })
+            {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    fn handle_server_op(&mut self) {
+        let Some(pinop) = self.queued_server_operation.take() else {
+            return;
+        };
+        match pinop {
+            ServerOperation::TogglePin { url } => {
+                if self.config.pinned_servers.contains(&url) {
+                    self.config.pinned_servers.shift_remove(&url);
+                } else {
+                    if !self.server_displays.contains_key(&url) {
+                        self.server_displays.insert(
+                            url.clone(),
+                            ServerDisplay {
+                                listing: ServerListing {
+                                    name: None,
+                                    address: url.clone(),
+                                },
+                                status: FetchStatus::Unfetched,
+                            },
+                        );
+                    }
+                    self.config.pinned_servers.insert(url);
+                }
+            }
+            ServerOperation::MoveUp { index } => {
+                if index == 0 {
+                    return;
+                }
+                self.config.pinned_servers.swap_indices(index, index - 1);
+            }
+            ServerOperation::MoveDown { index } => {
+                if index >= self.config.pinned_servers.len() - 1 {
+                    return;
+                }
+                self.config.pinned_servers.swap_indices(index, index + 1);
+            }
+            ServerOperation::Refresh { url } => {
+                let Some(server) = self.server_displays.get_mut(&url) else {
+                    return;
+                };
+                server.status = FetchStatus::Unfetched
+            }
+            ServerOperation::FetchServer { url } => {
+                let Some(server) = self.server_displays.get_mut(&url) else {
+                    return;
+                };
+                server.status = FetchStatus::Fetching;
+                worker::send(WorkerMessage::FetchServerData { url });
+            }
+            ServerOperation::FetchInfo { url } => {
+                let Some(ServerDisplay {
+                    status: FetchStatus::Fetched { info, .. },
+                    ..
+                }) = self.server_displays.get_mut(&url)
+                else {
+                    return;
+                };
+                *info = InfoStatus::Fetching;
+                worker::send(WorkerMessage::FetchServerInfo { url });
+            }
+        }
+        let _ = self.config.save().warn_for_error();
+    }
+
+    fn connect_to_server(&self, address: &str) {
+        log::info!("connecting to server {}", address);
+        // TODO
+    }
+
+    fn draw_server_buttons(
+        &self,
+        ui: &mut egui::Ui,
+        mode: ServerDrawMode,
+        listing: &ServerListing,
+    ) {
+        let pinned = self.config.pinned_servers.contains(&listing.address);
+        ui.set_max_height(20.0);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.button(if pinned { "Unpin" } else { "Pin" }).clicked() {
+                self.queue_op(ServerOperation::TogglePin {
+                    url: listing.address.clone(),
+                })
+            }
+            match mode {
+                ServerDrawMode::Hub => {}
+                ServerDrawMode::Pinned { index } => {
+                    if ui.button("⏷").clicked() {
+                        self.queue_op(ServerOperation::MoveDown { index })
+                    }
+                    if ui.button("⏶").clicked() {
+                        self.queue_op(ServerOperation::MoveUp { index })
+                    }
+                }
+            }
+        });
+    }
+
+    fn get_server_display(&self, url: &str) -> Option<&ServerDisplay> {
+        self.server_displays
+            .get(url)
+            .filter(|server| self.matches_search(server))
+    }
+
+    fn get_server_display_mut(&mut self, url: &str) -> Option<&mut ServerDisplay> {
+        let server = self.server_displays.get(url)?;
+        if !self.matches_search(server) {
+            return None;
+        }
+        self.server_displays.get_mut(url)
     }
 }
 
@@ -651,6 +1059,7 @@ fn parse_dir_url(url: &str) -> Result<Url, anyhow::Error> {
     }
     Url::parse(&s).map_err(|e| anyhow::anyhow!(e))
 }
+
 fn parse_file_url(url: &str) -> Result<Url, anyhow::Error> {
     let mut s = url.to_string();
     if let Some(stripped) = s.strip_suffix('/') {

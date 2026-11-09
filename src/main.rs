@@ -11,11 +11,15 @@ pub mod staticdata;
 pub mod utils;
 pub mod worker;
 
-use std::{backtrace::Backtrace, process::ExitCode, sync::LazyLock};
+use std::{
+    backtrace::Backtrace,
+    process::ExitCode,
+    sync::{LazyLock, atomic::Ordering},
+};
 
 use rfd::MessageDialog;
 
-use crate::staticdata::STATIC_DATA as S;
+use crate::{config::Config, staticdata::STATIC_DATA as S};
 
 fn main() -> ExitCode {
     std::panic::set_hook(Box::new(|info| {
@@ -29,7 +33,12 @@ fn main() -> ExitCode {
             .show();
         std::process::exit(-1);
     }));
-    
+
+    let config_res = Config::load();
+    worker::EXECUTOR_THREADS.store(
+        config_res.as_ref().map_or(1, |c| c.worker_threads),
+        Ordering::Relaxed,
+    );
     LazyLock::force(&S);
     utils::setup_logger();
 
@@ -42,15 +51,18 @@ fn main() -> ExitCode {
         persistence_path: Some(S.datapath.join(".egui")),
         ..Default::default()
     };
-    let res = eframe::run_native(
-        "Light Launcher",
-        options,
-        Box::new(|cc| {
-            gui::App::new()
-                .map(|a| Box::new(a) as Box<dyn eframe::App>)
-                .map_err(|e| e.into_boxed_dyn_error())
-        }),
-    );
+    let res = config_res.and_then(|config| {
+        eframe::run_native(
+            "Light Launcher",
+            options,
+            Box::new(|_cc| {
+                gui::App::new(config)
+                    .map(|a| Box::new(a) as Box<dyn eframe::App>)
+                    .map_err(|e| e.into_boxed_dyn_error())
+            }),
+        )
+        .map_err(|err| anyhow::anyhow!(err))
+    });
     match res {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
