@@ -15,7 +15,7 @@ use crate::{
     models::*,
     staticdata as s,
     utils::ResultExt,
-    worker::{self, FileDialogTarget, WorkerMessage},
+    worker::{self, FileDialogTarget},
 };
 
 macro_rules! ui_try {
@@ -97,7 +97,7 @@ impl eframe::App for App {
         }
         self.handle_server_op();
         self.refresh_tokens();
-        self.check_worker_thread();
+        worker::handle(self);
 
         ctx.request_repaint();
     }
@@ -147,10 +147,6 @@ impl eframe::App for App {
 
 impl App {
     pub fn new(config: Config) -> Result<Self, anyhow::Error> {
-        worker::EXECUTOR_THREADS.store(config.worker_threads, Ordering::Relaxed);
-        worker::send(WorkerMessage::SynchronizeSigningKey {
-            url: config.key_url.clone(),
-        });
         Ok(Self {
             server_displays: HashMap::new(),
             hub_servers: HubStatus::Unfetched,
@@ -334,9 +330,7 @@ impl App {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let response = ui.button("Browse...");
                     if response.clicked() {
-                        worker::send(WorkerMessage::OpenFileDialog {
-                            target: FileDialogTarget::LoaderPath,
-                        });
+                        worker::start(worker::open_file_dialog(FileDialogTarget::LoaderPath))
                     }
                     egui::TextEdit::singleline(&mut self.config.loader_path)
                         .hint_text(".../path/to/your/Robust.Loader")
@@ -379,9 +373,7 @@ impl App {
         egui::Grid::new("sync_grid").num_columns(2).show(ui, |ui| {
             let response = ui.button("Sync to:");
             if response.clicked() {
-                worker::send(WorkerMessage::SynchronizeSigningKey {
-                    url: self.config.key_url.clone(),
-                });
+                worker::start(worker::sync_signing_key(self.config.key_url.clone()));
             }
             egui::TextEdit::singleline(&mut self.config.key_url)
                 .hint_text(config::DEFAULT_KEY_URL)
@@ -457,10 +449,7 @@ impl App {
                             *message = "The auth URL is malformed. Check your config.".into();
                             return;
                         };
-                        worker::send(WorkerMessage::LogIn {
-                            auth: auth.clone(),
-                            url,
-                        });
+                        worker::start(worker::login(auth.clone(), url));
                         *message = "Logging in...".into();
                     }
                 });
@@ -510,117 +499,6 @@ impl App {
         }
     }
 
-    fn check_worker_thread(&mut self) {
-        loop {
-            let Some(res) = worker::check_for_response() else {
-                return;
-            };
-
-            match res {
-                crate::worker::WorkerResponse::Pong => log::debug!("pong"),
-                crate::worker::WorkerResponse::LogInSuccessful { account } => {
-                    if let Some(Subwindow::AddAccount { .. }) = self.subwindow {
-                        self.subwindow = None;
-                    }
-                    self.config
-                        .accounts
-                        .insert(account.user_id.clone(), account);
-                }
-                crate::worker::WorkerResponse::LogInFailure { error } => {
-                    if let Some(Subwindow::AddAccount { message, .. }) = &mut self.subwindow {
-                        *message = format!(
-                            "Failed: {}",
-                            if let Some(status) = error
-                                .downcast_ref::<reqwest::Error>()
-                                .and_then(|e| e.status())
-                            {
-                                status.to_string()
-                            } else {
-                                error.to_string()
-                            }
-                        );
-                    }
-                }
-                crate::worker::WorkerResponse::RefreshSuccessful { id, refresh } => {
-                    let Some(account) = self.config.accounts.get_mut(&id) else {
-                        return;
-                    };
-                    account.expire_time = refresh.expire_time;
-                    account.token = refresh.new_token;
-                }
-                crate::worker::WorkerResponse::RefreshFailure { id, error } => {
-                    log::warn!("failed to refresh token for account with ID {id}: {error}");
-                }
-                crate::worker::WorkerResponse::RefreshExpired { id } => {
-                    log::info!("account with ID {id} has an expired token");
-                }
-                crate::worker::WorkerResponse::FileChosen { path, target } => match target {
-                    crate::worker::FileDialogTarget::LoaderPath => self.config.loader_path = path,
-                },
-                crate::worker::WorkerResponse::Nop => {}
-                crate::worker::WorkerResponse::FetchFailure { error } => {
-                    self.hub_servers = HubStatus::Error(error)
-                }
-                crate::worker::WorkerResponse::FetchSuccessful { servers } => {
-                    let mut hub = IndexSet::new();
-                    for (url, server) in servers {
-                        hub.insert(url.clone());
-                        self.server_displays.insert(url, server);
-                    }
-                    self.hub_servers = HubStatus::Ok(hub)
-                }
-                crate::worker::WorkerResponse::StatusFetchSuccessful { url, status } => {
-                    let Some(server) = self.get_server_display_mut(&url) else {
-                        log::warn!("fetched bad url: {url}");
-                        return;
-                    };
-                    server.status = FetchStatus::Fetched {
-                        status,
-                        info: InfoStatus::Unfetched,
-                    }
-                }
-                crate::worker::WorkerResponse::StatusFetchFailure { url, error } => {
-                    let Some(server) = self.get_server_display_mut(&url) else {
-                        return;
-                    };
-                    server.status = FetchStatus::FetchError(error.to_string());
-                }
-                crate::worker::WorkerResponse::InfoFetchSuccessful { url, info } => {
-                    let Some(server) = self.get_server_display_mut(&url) else {
-                        log::warn!("fetched bad url: {url}");
-                        return;
-                    };
-                    let FetchStatus::Fetched {
-                        info: server_info, ..
-                    } = &mut server.status
-                    else {
-                        return;
-                    };
-                    *server_info = InfoStatus::Fetched(info);
-                }
-                crate::worker::WorkerResponse::InfoFetchFailure { url, error } => {
-                    let Some(server) = self.get_server_display_mut(&url) else {
-                        return;
-                    };
-                    let FetchStatus::Fetched {
-                        info: server_info, ..
-                    } = &mut server.status
-                    else {
-                        return;
-                    };
-                    *server_info = InfoStatus::FetchError(error.to_string());
-                }
-                worker::WorkerResponse::SyncKeySuccess { key } => {
-                    self.sync_error = None;
-                    self.config.signing_key = key
-                }
-                worker::WorkerResponse::SyncKeyFailure { error } => {
-                    self.sync_error = Some(error.to_string());
-                }
-            }
-        }
-    }
-
     fn refresh_tokens(&mut self) {
         if Instant::now() - self.last_refresh < s::TOKEN_REFRESH_INTERVAL {
             return;
@@ -632,13 +510,7 @@ impl App {
                 let Ok(url) = parse_dir_url(&self.config.auth_url) else {
                     return;
                 };
-                worker::send(WorkerMessage::RefreshToken {
-                    id: account.user_id.clone(),
-                    auth: RefreshRequest {
-                        token: account.token.clone(),
-                    },
-                    url,
-                });
+                worker::start(worker::refresh_token(account.user_id.clone(), account.token.clone(), url));
             }
         }
     }
@@ -646,9 +518,7 @@ impl App {
     fn refresh_servers(&mut self) {
         self.hub_servers = HubStatus::Fetching;
 
-        worker::send(WorkerMessage::FetchServers {
-            hub: self.config.hub_url.clone(),
-        });
+        worker::start(worker::fetch_servers(self.config.hub_url.clone()));
     }
 
     fn draw_server(&self, ui: &mut egui::Ui, url: &str, mode: ServerDrawMode) -> bool {
@@ -982,7 +852,7 @@ impl App {
                     return;
                 };
                 server.status = FetchStatus::Fetching;
-                worker::send(WorkerMessage::FetchServerData { url });
+                worker::start(worker::fetch_server_data(url));
             }
             ServerOperation::FetchInfo { url } => {
                 let Some(ServerDisplay {
@@ -993,7 +863,7 @@ impl App {
                     return;
                 };
                 *info = InfoStatus::Fetching;
-                worker::send(WorkerMessage::FetchServerInfo { url });
+                worker::send(worker::fetch_server_info(url));
             }
         }
         let _ = self.config.save().warn_for_error();

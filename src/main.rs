@@ -39,6 +39,7 @@ fn main() -> ExitCode {
         config_res.as_ref().map_or(1, |c| c.worker_threads),
         Ordering::Relaxed,
     );
+    
     LazyLock::force(&S);
     utils::setup_logger();
 
