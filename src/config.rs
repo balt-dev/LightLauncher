@@ -10,10 +10,6 @@ use indexmap::IndexSet;
 
 use crate::{models::Account, staticdata};
 
-fn core_count() -> usize {
-    std::thread::available_parallelism().map_or(1, |c| c.get())
-}
-
 pub static DEFAULT_KEY_URL: &'static str = "https://raw.githubusercontent.com/space-wizards/SS14.Launcher/master/SS14.Launcher/signing_key";
 fn key_url() -> String {
     DEFAULT_KEY_URL.into()
@@ -35,8 +31,6 @@ pub struct Config {
     pub selected_account: Option<String>,
     #[serde(default)]
     pub pinned_servers: IndexSet<String>,
-    #[serde(default = "core_count")]
-    pub worker_threads: usize,
     #[serde(default)]
     pub signing_key: String,
     #[serde(default = "key_url")]
@@ -65,7 +59,6 @@ impl Default for Config {
             accounts: HashMap::new(),
             selected_account: None,
             pinned_servers: IndexSet::new(),
-            worker_threads: core_count(),
             signing_key: String::new(),
             key_url: key_url(),
         }

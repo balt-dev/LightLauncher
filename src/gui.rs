@@ -349,20 +349,6 @@ impl App {
                         .ui(ui);
                 });
                 ui.end_row();
-
-                let label = ui.label("Background Thread Count:");
-                if label.hovered() {
-                    label.show_tooltip_text(
-                        "\
-                        The amount of background threads handling things like web requests.\n\
-                        You must restart the launcher before changes to this apply.\
-                    ",
-                    );
-                }
-                ui.add(
-                    egui::Slider::new(&mut self.config.worker_threads, 1..=16).suffix(" threads"),
-                );
-                ui.end_row();
             });
 
         ui.label("Signing Key");

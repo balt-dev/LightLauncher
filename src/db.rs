@@ -4,7 +4,7 @@ use std::{
 
 use rusqlite::Connection;
 
-use crate::models::Manifest;
+use crate::models::Digest;
 
 pub struct Database {
     root: PathBuf,
@@ -95,13 +95,13 @@ impl Database {
         })
     }
 
-    pub fn blob_exists(&self, digest: Manifest) -> bool {
+    pub fn blob_exists(&self, digest: Digest) -> bool {
         self.blobs.join(&digest.to_string()).exists()
     }
 
-    pub fn put_blob(&self, check: Manifest, data: Vec<u8>) -> Result<(), io::Error> {
+    pub fn put_blob(&self, check: Digest, data: Vec<u8>) -> Result<(), io::Error> {
         log::debug!("got content blob {check} ({} bytes)", data.len());
-        let hexdigest = Manifest::digest(&data);
+        let hexdigest = Digest::digest(&data);
         if check != hexdigest {
             log::warn!("content blob hash mismatch (expected {check:?}, got {hexdigest:?})");
             return Err(io::Error::new(

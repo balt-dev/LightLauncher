@@ -1,10 +1,9 @@
 [package]
 name = "light-launcher"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 
 [dependencies]
-smol = "2"
 serde_json = "1"
 serde = {version = "1", features = ["derive"]}
 eframe = {version = "0.37", features = ["persistence"]}
@@ -26,8 +25,7 @@ bytes = "1.12.1"
 ruzstd = "0.9.1"
 zip = "9.5.0"
 sha256 = { version = "1.6.0", default-features = false }
-deboa = "0.1.5"
 http = "1.5.0"
-deboa-smol = "0.1.4"
 url = "2.5.8"
-smol-timeout = "0.6.1"
+reqwest = { version = "0.13.5", features = ["stream"]}
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread"]}

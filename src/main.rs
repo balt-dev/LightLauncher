@@ -1,4 +1,4 @@
-#![feature(trim_prefix_suffix, once_cell_try)]
+#![feature(trim_prefix_suffix, once_cell_try, nonpoison_rwlock)]
 #![warn(clippy::pedantic, clippy::perf)]
 //! A lightweight SS14 launcher.
 
@@ -22,7 +22,8 @@ use rfd::MessageDialog;
 
 use crate::{config::Config, db::Database, staticdata::STATIC_DATA as S};
 
-fn main() -> ExitCode {
+#[tokio::main]
+async fn main() -> ExitCode {
     std::panic::set_hook(Box::new(|info| {
         log::error!("panic caught: {info}");
         let trace = Backtrace::force_capture();
@@ -36,10 +37,6 @@ fn main() -> ExitCode {
     }));
 
     let config_res = Config::load();
-    worker::EXECUTOR_THREADS.store(
-        config_res.as_ref().map_or(1, |c| c.worker_threads),
-        Ordering::Relaxed,
-    );
 
     LazyLock::force(&S);
     Database::init(&S.datapath).expect("failed to initialize database");

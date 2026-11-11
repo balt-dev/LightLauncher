@@ -1,10 +1,7 @@
 use crossbeam_queue::SegQueue;
-use deboa::errors::{DeboaError, ResponseError};
-use deboa_smol::HttpBody;
 use http::{HeaderName, Method, StatusCode};
 use indexmap::{IndexMap, IndexSet};
 use ruzstd::decoding::StreamingDecoder;
-use smol::{Executor, lock::OnceCell};
 use url::Url;
 use zip::ZipArchive;
 use std::{
@@ -12,35 +9,10 @@ use std::{
 };
 
 use crate::{
-    core::Frontend, db::{DATABASE, Database}, gui::{HubStatus, Subwindow}, models::*, utils::{self, SerdeNever},
+    core::Frontend, db::{DATABASE, Database}, gui::{HubStatus, Subwindow}, models::*, utils::{self, HTTP_CLIENT, SerdeNever},
 };
 
-pub(crate) static EXECUTOR_THREADS: AtomicUsize = AtomicUsize::new(0);
-static EXECUTOR: OnceCell<Executor> = OnceCell::new();
 static MESSAGES: SegQueue<Box<dyn FnOnce(&mut Frontend<'_>) + Send>> = SegQueue::new();
-
-fn exec() -> &'static Executor<'static> {
-    EXECUTOR.get_or_init_blocking(|| {
-        let worker_count = EXECUTOR_THREADS.load(Ordering::Relaxed);
-        if worker_count == 0 {
-            panic!("tried to load executor before executor thread count was set");
-        }
-        for n in 1..=worker_count {
-            std::thread::Builder::new()
-                .name(format!("worker-{}", n))
-                .spawn(|| {
-                    loop {
-                        catch_unwind(|| smol::block_on(exec().run(smol::future::pending::<()>())))
-                            .ok();
-                    }
-                })
-                .expect("could not spawn executor thread");
-        }
-        let ex = Executor::new();
-        ex.spawn(smol::process::driver()).detach();
-        ex
-    })
-}
 
 pub enum FileDialogTarget {
     LoaderPath,
@@ -60,10 +32,10 @@ macro_rules! wrap_async_task {
         handle = move |$app: ident, $payload: ident| $handle_payload_block: tt;
     ) => { {
         let coro = async move {$($task_block)*};
-        exec().spawn(async move {
+        tokio::spawn(async move {
             let res = coro.await;
             MESSAGES.push(Box::new(move |app| (|$app: &mut Frontend<'_>, $payload: $payload_ty| $handle_payload_block)(app, res)))
-        }).detach();
+        });
     } };
 }
 
@@ -211,9 +183,7 @@ pub(crate) fn refresh_token(id: String, token: String, url: Url) {
                     let refresh = serde_json::from_slice::<RefreshResponse>(&data)?;
                     Ok(TokenRefreshStatus::Success { refresh })
                 },
-                Err(err) if let DeboaError::Response(ResponseError::Receive {
-                    status_code: StatusCode::UNAUTHORIZED, ..
-                }) = err => Ok(TokenRefreshStatus::Expired),
+                Err(err) if let Some(StatusCode::UNAUTHORIZED) = err.status() => Ok(TokenRefreshStatus::Expired),
                 Err(err) => return Err(err)?
             }
         };
@@ -273,7 +243,10 @@ pub(crate) fn fetch_server_data(url: String) {
                     let status = serde_json::from_slice::<ServerStatus>(&data)?;
                     Ok(status)
                 },
-                Err(err) => return Err(err)?
+                Err(err) => {
+                    log::warn!("{err}");
+                    return Err(err)?
+                }
             }
         };
         handle = move |app, res| {
@@ -326,13 +299,13 @@ pub(crate) fn fetch_server_info(url: String) {
 pub fn acquire(build: BuildInformation) {
     let db = DATABASE.wait();
     wrap_async_task! {
-        payload = anyhow::Result<Vec<(Manifest, PathBuf)>>;
+        payload = anyhow::Result<Vec<(Digest, PathBuf)>>;
         task = move || {
             if let BuildInformation { manifest_url: Some(man), manifest_download_url: Some(man_dl), .. } = build {
                 let sane_url = Url::parse(&utils::sanitize_url(&man))?;
                 let response = utils::request(sane_url, Method::GET, None::<()>).await?;
                 let manifest = utils::get_bytes(response, |_| {}).await?;
-                if build.manifest_hash.is_some_and(|hash| hash != Manifest::digest(&*manifest)) {
+                if build.manifest_hash.is_some_and(|hash| hash != Digest::digest(&*manifest)) {
                     log::error!("build manifest hash did not match expected");
                     anyhow::bail!("build manifest hash did not match expected");
                 }
@@ -348,10 +321,10 @@ pub fn acquire(build: BuildInformation) {
                     for index in &missing {
                         body.extend((*index as u32).to_le_bytes());
                     }
-                    let req = deboa::request::post(man_dl)?
-                        .header(HeaderName::from_static("Content-Type"), "application/octet-stream")?
-                        .header(HeaderName::from_static("X-Robust-Download-Protocol"), "1")?
-                        .body(HttpBody::bytes(&body));
+                    let req = HTTP_CLIENT.post(man_dl)
+                        .header(HeaderName::from_static("Content-Type"), "application/octet-stream")
+                        .header(HeaderName::from_static("X-Robust-Download-Protocol"), "1")
+                        .body(body);
                     let res = utils::request_raw(req).await?;
                     update_dl(DownloadId::BuildManifestCount)(Some(DownloadProgress { current: 0, total: Some(missing.len()) }));
                     let bytes = utils::get_bytes(res, update_dl(DownloadId::BuildManifest)).await?;
@@ -400,7 +373,7 @@ pub fn acquire(build: BuildInformation) {
                 let mut file = zip.by_name(&path)?;
                 let mut bytes = Vec::with_capacity(file.size() as usize);
                 file.read_to_end(&mut bytes)?;
-                let digest = Manifest::digest(&bytes);
+                let digest = Digest::digest(&bytes);
                 db.put_blob(digest, bytes)?;
                 manifest.push((digest, PathBuf::from(path)));
             }
@@ -415,7 +388,7 @@ pub fn acquire(build: BuildInformation) {
     }
 }
 
-fn parse_manifest(manifest: bytes::Bytes) -> Result<Vec<(Manifest, PathBuf)>, anyhow::Error> {
+fn parse_manifest(manifest: bytes::Bytes) -> Result<Vec<(Digest, PathBuf)>, anyhow::Error> {
     let data = String::from_utf8(manifest.to_vec())?;
     let mut lines = data.lines();
     let Some("Robust Content Manifest 1") = lines.next() else {
