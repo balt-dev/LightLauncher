@@ -5,11 +5,11 @@ use ruzstd::decoding::StreamingDecoder;
 use url::Url;
 use zip::ZipArchive;
 use std::{
-    ffi::OsString, io::{Cursor, Read}, panic::catch_unwind, path::PathBuf, sync::{Arc, atomic::{AtomicUsize, Ordering}},
+    io::{Cursor, Read}, path::PathBuf,
 };
 
 use crate::{
-    core::Frontend, db::{DATABASE, Database}, gui::{HubStatus, Subwindow}, models::*, utils::{self, HTTP_CLIENT, SerdeNever},
+    core::Frontend, db::DATABASE, gui::{HubStatus, Subwindow}, models::*, networking::{self, HTTP_CLIENT}, utils::{self, SerdeNever},
 };
 
 static MESSAGES: SegQueue<Box<dyn FnOnce(&mut Frontend<'_>) + Send>> = SegQueue::new();
@@ -57,8 +57,8 @@ pub(crate) fn login(auth: AuthRequest, url: Url) {
     wrap_async_task! {
         payload = anyhow::Result<Account>;
         task = move || {
-            let response = utils::request(url, Method::POST, Some(auth)).await?;
-            let data = utils::get_bytes(response, |_| {}).await?;
+            let response = networking::request(url, Method::POST, Some(auth)).await?;
+            let data = networking::get_bytes(response, |_| {}).await?;
             let model = serde_json::from_slice(&data)?;
             Ok::<_, anyhow::Error>(model)
         };
@@ -125,8 +125,8 @@ pub(crate) fn fetch_servers(hub: String) {
     wrap_async_task! {
         payload = anyhow::Result<IndexMap<String, ServerDisplay>>;
         task = move || {
-            let response = utils::request(Url::try_from(&*hub)?, Method::GET, None::<SerdeNever>).await?;
-            let data = utils::get_bytes(response, update_dl(DownloadId::ServerList)).await?;
+            let response = networking::request(Url::try_from(&*hub)?, Method::GET, None::<SerdeNever>).await?;
+            let data = networking::get_bytes(response, update_dl(DownloadId::ServerList)).await?;
             let servers = serde_json::from_slice::<Vec<ServerEntry>>(&data)?;
             let mut servers = servers
                 .into_iter()
@@ -176,10 +176,10 @@ pub(crate) fn refresh_token(id: String, token: String, url: Url) {
     wrap_async_task! {
         payload = anyhow::Result<TokenRefreshStatus>;
         task = move || {
-            let response = utils::request(url, Method::POST, Some(RefreshRequest { token })).await;
+            let response = networking::request(url, Method::POST, Some(RefreshRequest { token })).await;
             match response {
                 Ok(res) => {
-                    let data = utils::get_bytes(res, |_| {}).await?;
+                    let data = networking::get_bytes(res, |_| {}).await?;
                     let refresh = serde_json::from_slice::<RefreshResponse>(&data)?;
                     Ok(TokenRefreshStatus::Success { refresh })
                 },
@@ -212,8 +212,8 @@ pub(crate) fn sync_signing_key(url: String) {
     wrap_async_task! {
         payload = anyhow::Result<String>;
         task = move || {
-            let response = utils::request(Url::try_from(&*utils::sanitize_url(&url))?, Method::GET, None::<()>).await?;
-            let data = utils::get_bytes(response, |_| {}).await?;
+            let response = networking::request(Url::try_from(&*utils::sanitize_url(&url))?, Method::GET, None::<()>).await?;
+            let data = networking::get_bytes(response, |_| {}).await?;
             let key = String::from_utf8_lossy(&*data).to_string();
             Ok(key)
         };
@@ -234,12 +234,12 @@ pub(crate) fn fetch_server_data(url: String) {
     wrap_async_task! {
         payload = anyhow::Result<ServerStatus>;
         task = move || {
-            match utils::request(
+            match networking::request(
                 sane_url?,
                 Method::GET, None::<()>
             ).await {
                 Ok(response) => {
-                    let data = utils::get_bytes(response, |_| {}).await?;
+                    let data = networking::get_bytes(response, |_| {}).await?;
                     let status = serde_json::from_slice::<ServerStatus>(&data)?;
                     Ok(status)
                 },
@@ -268,12 +268,12 @@ pub(crate) fn fetch_server_info(url: String) {
     wrap_async_task! {
         payload = anyhow::Result<ServerInfo>;
         task = move || {
-            match utils::request(
+            match networking::request(
                 sane_url?,
                 Method::GET, None::<()>
             ).await {
                 Ok(response) => {
-                    let data = utils::get_bytes(response, |_| {}).await?;
+                    let data = networking::get_bytes(response, |_| {}).await?;
                     let status = serde_json::from_slice::<ServerInfo>(&data)?;
                     Ok(status)
                 },
@@ -303,8 +303,8 @@ pub fn acquire(build: BuildInformation) {
         task = move || {
             if let BuildInformation { manifest_url: Some(man), manifest_download_url: Some(man_dl), .. } = build {
                 let sane_url = Url::parse(&utils::sanitize_url(&man))?;
-                let response = utils::request(sane_url, Method::GET, None::<()>).await?;
-                let manifest = utils::get_bytes(response, |_| {}).await?;
+                let response = networking::request(sane_url, Method::GET, None::<()>).await?;
+                let manifest = networking::get_bytes(response, |_| {}).await?;
                 if build.manifest_hash.is_some_and(|hash| hash != Digest::digest(&*manifest)) {
                     log::error!("build manifest hash did not match expected");
                     anyhow::bail!("build manifest hash did not match expected");
@@ -325,9 +325,9 @@ pub fn acquire(build: BuildInformation) {
                         .header(HeaderName::from_static("Content-Type"), "application/octet-stream")
                         .header(HeaderName::from_static("X-Robust-Download-Protocol"), "1")
                         .body(body);
-                    let res = utils::request_raw(req).await?;
+                    let res = networking::request_raw(req).await?;
                     update_dl(DownloadId::BuildManifestCount)(Some(DownloadProgress { current: 0, total: Some(missing.len()) }));
-                    let bytes = utils::get_bytes(res, update_dl(DownloadId::BuildManifest)).await?;
+                    let bytes = networking::get_bytes(res, update_dl(DownloadId::BuildManifest)).await?;
                     let mut bytes = Cursor::new(&*bytes);
                     let mut int_buf = [0u8; 4];
                     bytes.read_exact(&mut int_buf)?;
@@ -356,8 +356,8 @@ pub fn acquire(build: BuildInformation) {
             }
             let BuildInformation { download_url, hash, .. } = build;
             let sane_url = Url::parse(&utils::sanitize_url(&download_url))?;
-            let response = utils::request(sane_url, Method::GET, None::<()>).await?;
-            let zip_raw = utils::get_bytes(response, update_dl(DownloadId::BuildZip)).await?;
+            let response = networking::request(sane_url, Method::GET, None::<()>).await?;
+            let zip_raw = networking::get_bytes(response, update_dl(DownloadId::BuildZip)).await?;
             let sha256 = sha256::digest(&*zip_raw);
             if sha256.to_ascii_lowercase() != hash.to_ascii_lowercase() {
                 anyhow::bail!("sha256 mismatch (expected {hash}, got {sha256})");

@@ -11,6 +11,7 @@ pub mod serde;
 pub mod staticdata;
 pub mod utils;
 pub mod worker;
+pub mod networking;
 
 use std::{
     backtrace::Backtrace,
