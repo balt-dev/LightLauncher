@@ -4,14 +4,14 @@ use serde::{Deserializer, Serializer, de::Visitor};
 pub mod url {
     use super::*;
 
-    pub fn serialize<S>(url: &reqwest::Url, ser: S) -> Result<S::Ok, S::Error>
+    pub fn serialize<S>(url: &::url::Url, ser: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
         ser.serialize_str(url.as_str())
     }
 
-    pub fn deserialize<'de, D>(de: D) -> Result<reqwest::Url, D::Error>
+    pub fn deserialize<'de, D>(de: D) -> Result<::url::Url, D::Error>
     where
         D: Deserializer<'de>,
     {
@@ -21,13 +21,13 @@ pub mod url {
     struct UrlVisitor;
 
     impl<'de> Visitor<'de> for UrlVisitor {
-        type Value = reqwest::Url;
+        type Value = ::url::Url;
 
         fn visit_borrowed_str<E>(self, v: &'de str) -> Result<Self::Value, E>
         where
             E: serde::de::Error,
         {
-            reqwest::Url::parse(v).map_err(|e| E::custom(e))
+            ::url::Url::parse(v).map_err(|e| E::custom(e))
         }
 
         fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {

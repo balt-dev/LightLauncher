@@ -1,13 +1,11 @@
 //! Contains data models for data being transmitted across the application and server.
 
 use std::borrow::Cow;
-use std::cell::Cell;
 use std::collections::HashMap;
 use std::str::FromStr;
-use std::sync::Mutex;
 
-use blake2::{Blake2b, Digest};
 use blake2::digest::consts::U32;
+use blake2::{Blake2b, Digest};
 use chrono::FixedOffset;
 
 /// Live status information advertised by a game server.
@@ -293,7 +291,9 @@ impl ServerDisplay {
 pub struct Manifest([u8; 32]);
 
 impl AsRef<[u8; 32]> for Manifest {
-    fn as_ref(&self) -> &[u8; 32] { &self.0 }
+    fn as_ref(&self) -> &[u8; 32] {
+        &self.0
+    }
 }
 
 impl Manifest {
@@ -301,31 +301,49 @@ impl Manifest {
         let mut hasher = Blake2b::<U32>::new();
         hasher.update(&data);
         let digest = hasher.finalize();
-        Self(*digest.as_array().expect("U32 type should guarantee this slice is 32 bytes long"))
+        Self(
+            *digest
+                .as_array()
+                .expect("U32 type should guarantee this slice is 32 bytes long"),
+        )
     }
 }
 
 impl PartialEq<[u8]> for Manifest {
     fn eq(&self, other: &[u8]) -> bool {
-        let Some(arr): Option<&[u8; 32]> = other.as_array() else { return false };
+        let Some(arr): Option<&[u8; 32]> = other.as_array() else {
+            return false;
+        };
         self.0.eq(arr)
     }
 }
 
 impl std::fmt::Display for Manifest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0.iter().map(|b| format!("{b:02X}")).collect::<String>())
+        f.write_str(
+            &self
+                .0
+                .iter()
+                .map(|b| format!("{b:02X}"))
+                .collect::<String>(),
+        )
     }
 }
 
 impl serde::Serialize for Manifest {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error> where S: serde::Serializer {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
         serializer.serialize_str(&self.to_string())
     }
 }
 
 impl<'de> serde::Deserialize<'de> for Manifest {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error> where D: serde::Deserializer<'de> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
         deserializer.deserialize_str(ManifestVisitor)
     }
 }
@@ -337,8 +355,11 @@ impl<'de> serde::de::Visitor<'de> for ManifestVisitor {
     fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(f, "a string representing a 32-byte Blake2b hash")
     }
-    
-    fn visit_str<E>(self, v: &str) -> Result<Self::Value, E> where E: serde::de::Error {
+
+    fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
         v.parse::<Manifest>().map_err(E::custom)
     }
 }
@@ -351,7 +372,8 @@ impl FromStr for Manifest {
         }
         let mut arr = [0; 32];
         for i in 0..32 {
-            let byte = u8::from_str_radix(&v[i * 2 .. i * 2 + 2], 16).expect("we already checked the whole string");
+            let byte = u8::from_str_radix(&v[i * 2..i * 2 + 2], 16)
+                .expect("we already checked the whole string");
             arr[i] = byte;
         }
         Ok(Manifest(arr))

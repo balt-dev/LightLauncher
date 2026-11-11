@@ -1,17 +1,10 @@
 use std::{
-    collections::HashMap, fs::File, io::{self, Cursor, Read, Write}, path::{Path, PathBuf}, sync::{Mutex, atomic::AtomicBool},
+    fs::File, io::{self, Write}, path::{Path, PathBuf}, sync::{LazyLock, Mutex, OnceLock, atomic::AtomicBool},
 };
 
-use blake2::{Blake2b, Digest, digest::consts::U32};
-use indexmap::IndexMap;
-use reqwest::{Method, Url};
 use rusqlite::Connection;
-use ruzstd::decoding::StreamingDecoder;
-use serde::Deserialize;
 
-use crate::{models::{BuildInformation, EngineManifestEntry, Manifest}, utils::{self, HTTP_CLIENT, SerdeNever}};
-
-static DB_INIT: AtomicBool = AtomicBool::new(false);
+use crate::models::Manifest;
 
 pub struct Database {
     root: PathBuf,
@@ -19,103 +12,102 @@ pub struct Database {
     conn: Mutex<Connection>,
 }
 
+pub static DATABASE: OnceLock<Database> = OnceLock::new();
+
 impl Database {
-    pub fn init(datapath: &Path) -> Result<Database, anyhow::Error> {
-        if DB_INIT.load(std::sync::atomic::Ordering::Relaxed) {
-            return Err(anyhow::anyhow!("database already initialized"));
-        }
-        DB_INIT.store(true, std::sync::atomic::Ordering::Relaxed);
-
-        let root = datapath.to_path_buf();
-        let blobs = datapath.join("blobs");
-
-        std::fs::create_dir_all(&blobs)?;
-
-        let conn = Connection::open(datapath.join("content.db"))?;
-
-        conn.execute_batch(
-            "
-            BEGIN;
-            PRAGMA foreign_keys = ON;
-            
-            CREATE TABLE IF NOT EXISTS Files(Path TEXT PRIMARY KEY, Digest TEXT NOT NULL);
-    
-            CREATE TABLE IF NOT EXISTS ContentVersion(
-                Id INTEGER PRIMARY KEY AUTOINCREMENT,
-                Hash BLOB NOT NULL,
-                ForkId TEXT,
-                ForkVersion TEXT,
-                LastUsed TEXT NOT NULL,
-                ZipHash BLOB
-            );
-    
-            CREATE TABLE IF NOT EXISTS Content(
-                Id INTEGER PRIMARY KEY AUTOINCREMENT,
-                Hash BLOB NOT NULL UNIQUE,
-                Size INTEGER NOT NULL,
-                Compression INTEGER NOT NULL,
-                Data BLOB NOT NULL
-            );
-    
-            CREATE TABLE IF NOT EXISTS ContentManifest(
-                Id INTEGER PRIMARY KEY AUTOINCREMENT,
-                VersionId INTEGER NOT NULL REFERENCES ContentVersion(Id)
-                    ON DELETE CASCADE,
-                Path TEXT NOT NULL,
-                ContentId INTEGER NOT NULL REFERENCES Content(Id)
-                    ON DELETE RESTRICT,
-                UNIQUE(VersionId, Path)
-            );
-    
-            CREATE TABLE IF NOT EXISTS ContentEngineDependency(
-                Id INTEGER PRIMARY KEY AUTOINCREMENT,
-                VersionId INTEGER NOT NULL REFERENCES ContentVersion(Id)
-                    ON DELETE CASCADE,
-                ModuleName TEXT NOT NULL,
-                ModuleVersion TEXT NOT NULL,
-                UNIQUE(VersionId, ModuleName)
-            );
-    
-            CREATE TABLE IF NOT EXISTS InterruptedDownload(
-                Id INTEGER PRIMARY KEY AUTOINCREMENT,
-                Added TEXT NOT NULL
-            );
-    
-            CREATE TABLE IF NOT EXISTS InterruptedDownloadContent(
-                Id INTEGER PRIMARY KEY AUTOINCREMENT,
-                InterruptedDownloadId INTEGER NOT NULL
-                    REFERENCES InterruptedDownload(Id) ON DELETE CASCADE,
-                ContentId INTEGER NOT NULL UNIQUE
-                    REFERENCES Content(Id) ON DELETE CASCADE
-            );
-    
-            CREATE TABLE IF NOT EXISTS RunningClient(
-                ProcessId INTEGER PRIMARY KEY NOT NULL,
-                MainModule TEXT NOT NULL,
-                UsedVersion INTEGER NOT NULL
-                    REFERENCES ContentVersion(Id) ON DELETE RESTRICT
-            );
-            COMMIT;
-        ",
-        )?;
-
-        Ok(Database {
-            root,
-            blobs,
-            conn: Mutex::new(conn),
+    pub fn init(datapath: &Path) -> Result<&'static Database, anyhow::Error> {
+        DATABASE.get_or_try_init(|| {
+            let root = datapath.to_path_buf();
+            let blobs = datapath.join("blobs");
+            std::fs::create_dir_all(&blobs)?;
+            let conn = Connection::open(datapath.join("content.db"))?;
+            conn.execute_batch(
+                "
+                BEGIN;
+                PRAGMA foreign_keys = ON;
+                
+                CREATE TABLE IF NOT EXISTS Files(Path TEXT PRIMARY KEY, Digest TEXT NOT NULL);
+        
+                CREATE TABLE IF NOT EXISTS ContentVersion(
+                    Id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    Hash BLOB NOT NULL,
+                    ForkId TEXT,
+                    ForkVersion TEXT,
+                    LastUsed TEXT NOT NULL,
+                    ZipHash BLOB
+                );
+        
+                CREATE TABLE IF NOT EXISTS Content(
+                    Id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    Hash BLOB NOT NULL UNIQUE,
+                    Size INTEGER NOT NULL,
+                    Compression INTEGER NOT NULL,
+                    Data BLOB NOT NULL
+                );
+        
+                CREATE TABLE IF NOT EXISTS ContentManifest(
+                    Id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    VersionId INTEGER NOT NULL REFERENCES ContentVersion(Id)
+                        ON DELETE CASCADE,
+                    Path TEXT NOT NULL,
+                    ContentId INTEGER NOT NULL REFERENCES Content(Id)
+                        ON DELETE RESTRICT,
+                    UNIQUE(VersionId, Path)
+                );
+        
+                CREATE TABLE IF NOT EXISTS ContentEngineDependency(
+                    Id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    VersionId INTEGER NOT NULL REFERENCES ContentVersion(Id)
+                        ON DELETE CASCADE,
+                    ModuleName TEXT NOT NULL,
+                    ModuleVersion TEXT NOT NULL,
+                    UNIQUE(VersionId, ModuleName)
+                );
+        
+                CREATE TABLE IF NOT EXISTS InterruptedDownload(
+                    Id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    Added TEXT NOT NULL
+                );
+        
+                CREATE TABLE IF NOT EXISTS InterruptedDownloadContent(
+                    Id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    InterruptedDownloadId INTEGER NOT NULL
+                        REFERENCES InterruptedDownload(Id) ON DELETE CASCADE,
+                    ContentId INTEGER NOT NULL UNIQUE
+                        REFERENCES Content(Id) ON DELETE CASCADE
+                );
+        
+                CREATE TABLE IF NOT EXISTS RunningClient(
+                    ProcessId INTEGER PRIMARY KEY NOT NULL,
+                    MainModule TEXT NOT NULL,
+                    UsedVersion INTEGER NOT NULL
+                        REFERENCES ContentVersion(Id) ON DELETE RESTRICT
+                );
+                COMMIT;
+            ",
+            )?;
+        
+            Ok(Database {
+                root,
+                blobs,
+                conn: Mutex::new(conn),
+            })
         })
     }
 
     pub fn blob_exists(&self, digest: Manifest) -> bool {
         self.blobs.join(&digest.to_string()).exists()
     }
-    
+
     pub fn put_blob(&self, check: Manifest, data: Vec<u8>) -> Result<(), io::Error> {
         log::debug!("got content blob {check} ({} bytes)", data.len());
         let hexdigest = Manifest::digest(&data);
         if check != hexdigest {
             log::warn!("content blob hash mismatch (expected {check:?}, got {hexdigest:?})");
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "content blob hash mismatch"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "content blob hash mismatch",
+            ));
         }
         if !self.blob_exists(hexdigest) {
             let mut fs = File::create(self.blobs.join(hexdigest.to_string()))?;

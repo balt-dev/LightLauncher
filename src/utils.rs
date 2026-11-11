@@ -1,19 +1,23 @@
 use std::{
-    fmt::Display, fs::{self, File}, io::Write, sync::{LazyLock, Mutex, MutexGuard},
+    fmt::Display, fs::{self, File}, sync::{LazyLock, Mutex, MutexGuard}, thread, time::Duration,
 };
 
-use blake2::{Blake2b, Digest, digest::consts::U32};
+use bytes::Bytes;
 use chrono::Local;
+use deboa::{errors::{DeboaError, RequestError, ResponseError}, request::{DeboaRequest, DeboaRequestBuilder}, response::DeboaResponse};
+use http::{Method, header};
 use log::LevelFilter;
-use reqwest::{Client, Method, Url, header};
 use simplelog::{
-    ColorChoice, CombinedLogger, Config, ConfigBuilder, SharedLogger, TermLogger, TerminalMode,
-    WriteLogger,
+    ColorChoice, CombinedLogger, ConfigBuilder, SharedLogger, TermLogger, TerminalMode, WriteLogger,
 };
+use smol::stream::StreamExt;
+use deboa_smol::{Client, HttpBody};
+use smol_timeout::TimeoutExt;
+use url::Url;
 
-use crate::{staticdata, utils};
+use crate::{staticdata, worker::DownloadProgress};
 
-pub static HTTP_CLIENT: LazyLock<Client> = LazyLock::new(|| Client::new());
+pub static HTTP_CLIENT: LazyLock<Client> = LazyLock::new(|| Client::default());
 
 pub fn setup_logger() {
     let now = Local::now().format("%Y-%m-%dT%H-%M-%S");
@@ -84,43 +88,75 @@ impl serde::Serialize for SerdeNever {
     }
 }
 
-async fn request_inner<U: serde::Serialize>(
+pub async fn request<U: serde::Serialize>(
     url: Url,
-    auth: Option<U>,
     method: Method,
-) -> Result<reqwest::Response, reqwest::Error> {
-    let mut req = HTTP_CLIENT
-        .request(method, url)
-        .header(header::USER_AGENT, staticdata::USER_AGENT)
-        .timeout(staticdata::REQUEST_TIMEOUT);
-    if let Some(auth) = auth {
-        req = req.json(&auth);
-    }
-    let res = req.send().await;
-
-    res.and_then(|r| r.error_for_status())
+    payload: Option<U>,
+) -> Result<DeboaResponse, DeboaError> {
+    let payload = match payload {
+        Some(val) => {
+            let body = serde_json::ser::to_string(&val)
+                .map_err(|err| DeboaError::Request(RequestError::Parse { message: err.to_string() }))?;
+            Some(Bytes::from(body.into_bytes()))
+        },
+        None => None
+    };
+    request_bytes(url, method, payload).await
 }
 
-pub async fn request_bytes<U: serde::Serialize>(
+pub async fn request_bytes(
     url: Url,
-    auth: Option<U>,
     method: Method,
-) -> Result<bytes::Bytes, reqwest::Error> {
-    match request_inner(url, auth, method).await {
-        Ok(r) => r.bytes().await,
-        Err(err) => Err(err),
+    payload: Option<Bytes>,
+) -> Result<DeboaResponse, DeboaError> {
+    let mut req = deboa::request::get(url)?
+        .method(method);
+    if let Some(body) = payload {
+        req = req.body(HttpBody::bytes(&body));
     }
+    request_raw(req).await
 }
 
-pub async fn request_json<T: serde::de::DeserializeOwned, U: serde::Serialize>(
-    url: Url,
-    auth: Option<U>,
-    method: Method,
-) -> Result<T, reqwest::Error> {
-    match request_inner(url, auth, method).await {
-        Ok(r) => r.json::<T>().await,
-        Err(err) => Err(err),
+pub async fn request_raw(req: DeboaRequestBuilder) -> Result<DeboaResponse, DeboaError> {
+    let res = req
+        .header(header::USER_AGENT, staticdata::USER_AGENT)?
+        .send_with(&*HTTP_CLIENT)
+        .timeout(staticdata::REQUEST_TIMEOUT)
+        .await;
+    let Some(res) = res else {
+        return Err(DeboaError::Connection(deboa::errors::ConnectionError::Timeout { message: "request timed out".to_string() }))
+    };
+    res.and_then(|r| {
+        let status = r.status();
+        if status.is_success() {
+            return Ok(r);
+        } else {
+            return Err(DeboaError::Response(ResponseError::Receive {
+                status_code: status,
+                message: status.canonical_reason().unwrap_or("?").to_string()
+            }))
+        }
+    })
+}
+
+pub async fn get_bytes(
+    response: DeboaResponse,
+    mut update: impl FnMut(Option<DownloadProgress>),
+) -> anyhow::Result<Bytes> {
+    let mut res = Vec::new();
+    let total = response.content_length().map(|i| i as usize).ok();
+    let mut stream = response.stream();
+    let mut current = 0;
+    update(Some(DownloadProgress { current, total }));
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        let Some(chunk) = chunk.data_ref() else { continue };
+        current += chunk.len();
+        update(Some(DownloadProgress { current, total }));
+        res.extend(chunk);
     }
+    update(None);
+    Ok(bytes::Bytes::from(res))
 }
 
 pub fn sanitize_url(url: &str) -> String {

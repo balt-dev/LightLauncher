@@ -62,16 +62,3 @@ fn acquire_from_manifest(&self, man: &str, man_dl: &str) {
     worker::
 }
 
-fn parse_manifest(&self, manifest: bytes::Bytes) -> Result<Vec<(Manifest, PathBuf)>, anyhow::Error> {
-    let data = String::from_utf8(manifest.to_vec())?;
-    let mut lines = data.lines();
-    let Some("Robust Content Manifest 1") = lines.next() else {
-        anyhow::bail!("incorrect header string")
-    };
-    lines.map(|line| {
-        let Some((digest, path)) = line.split_once(' ') else { anyhow::bail!("invalid digest/path pair") };
-        let hash = digest.parse()?;
-        let path = path.parse()?;
-        Ok((hash, path))
-    }).collect()
-}

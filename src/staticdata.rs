@@ -14,8 +14,7 @@ pub static USER_AGENT: &'static str = concat!("LightLauncher/", env!("CARGO_PKG_
 
 pub struct StaticData {
     pub datapath: PathBuf,
-    pub subwindow_layer: LayerId,
-    pub db: Database,
+    pub subwindow_layer: LayerId
 }
 
 pub static STATIC_DATA: LazyLock<StaticData> = LazyLock::new(|| {
@@ -31,19 +30,11 @@ pub static STATIC_DATA: LazyLock<StaticData> = LazyLock::new(|| {
             std::process::exit(1);
         }
     }
-    let db = match Database::init(&datapath.join("data")) {
-        Ok(conn) => conn,
-        Err(err) => {
-            eprintln!("failed during init: could not open database: {err}");
-            std::process::exit(1);
-        }
-    };
     StaticData {
         datapath: datapath.to_path_buf(),
         subwindow_layer: LayerId {
             order: Order::Foreground,
             id: Id::unique("subwindow"),
-        },
-        db,
+        }
     }
 });

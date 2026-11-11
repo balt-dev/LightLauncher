@@ -3,6 +3,7 @@ use std::{
     env,
     fs::File,
     io::{self, Read, Write},
+    path::PathBuf,
 };
 
 use indexmap::IndexSet;
@@ -27,7 +28,7 @@ pub struct Config {
     #[serde(default)]
     pub auth_url: String,
     #[serde(default)]
-    pub loader_path: String,
+    pub loader_path: PathBuf,
     #[serde(default)]
     pub accounts: HashMap<String, Account>,
     #[serde(default)]
@@ -53,16 +54,12 @@ impl Default for Config {
                     .expect("failed to get current exe")
                     .join("../loader/Robust.Loader.exe")
                     .canonicalize()
-                    .expect("failed to get loader path")
-                    .to_string_lossy()
-                    .to_string(),
+                    .expect("failed to get loader path"),
                 target_os = "linux" => env::current_exe()
                     .expect("failed to get current exe")
                     .join("../loader/Robust.Loader")
                     .canonicalize()
-                    .expect("failed to get loader path")
-                    .to_string_lossy()
-                    .to_string(),
+                    .expect("failed to get loader path"),
                 _ => "".into(),
             },
             accounts: HashMap::new(),

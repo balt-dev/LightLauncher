@@ -1,8 +1,9 @@
-#![feature(trim_prefix_suffix)]
+#![feature(trim_prefix_suffix, once_cell_try)]
 #![warn(clippy::pedantic, clippy::perf)]
 //! A lightweight SS14 launcher.
 
 pub mod config;
+pub mod core;
 pub mod db;
 pub mod gui;
 pub mod models;
@@ -19,7 +20,7 @@ use std::{
 
 use rfd::MessageDialog;
 
-use crate::{config::Config, staticdata::STATIC_DATA as S};
+use crate::{config::Config, db::Database, staticdata::STATIC_DATA as S};
 
 fn main() -> ExitCode {
     std::panic::set_hook(Box::new(|info| {
@@ -39,8 +40,9 @@ fn main() -> ExitCode {
         config_res.as_ref().map_or(1, |c| c.worker_threads),
         Ordering::Relaxed,
     );
-    
+
     LazyLock::force(&S);
+    Database::init(&S.datapath).expect("failed to initialize database");
     utils::setup_logger();
 
     let options = eframe::NativeOptions {

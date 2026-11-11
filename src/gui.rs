@@ -1,33 +1,24 @@
 use std::{
     cell::Cell,
     collections::HashMap,
-    sync::atomic::Ordering,
+    path::PathBuf,
+    str::FromStr,
     time::{Duration, Instant},
 };
 
 use chrono::{Local, prelude::*};
-use egui::{RichText, Sense, TextStyle, Vec2, Widget, Window, collapsing_header::CollapsingState};
+use egui::{RichText, Vec2, Widget, Window, collapsing_header::CollapsingState};
 use indexmap::IndexSet;
-use reqwest::Url;
+use ::url::Url;
 
 use crate::{
     config::{self, Config},
+    core::Frontend,
     models::*,
     staticdata as s,
     utils::ResultExt,
-    worker::{self, FileDialogTarget},
+    worker::{self, DownloadId, FileDialogTarget},
 };
-
-macro_rules! ui_try {
-    ($expr: expr) => {{
-        match $expr {
-            Ok(_) => (),
-            Err(err) => {
-                log::error!("error while drawing UI: {err}");
-            }
-        }
-    }};
-}
 
 pub enum TabSelection {
     ServerListing,
@@ -41,7 +32,7 @@ enum ServerDrawMode {
     Pinned { index: usize },
 }
 
-enum ServerOperation {
+pub enum ServerOperation {
     TogglePin { url: String },
     MoveUp { index: usize },
     MoveDown { index: usize },
@@ -75,11 +66,13 @@ pub struct App {
     pub tab: TabSelection,
     pub subwindow: Option<Subwindow>,
     pub last_refresh: Instant,
-    queued_server_operation: Cell<Option<ServerOperation>>,
-    search_text: String,
-    tag_whitelist: String,
-    tag_blacklist: String,
-    sync_error: Option<String>,
+    pub queued_server_operation: Cell<Option<ServerOperation>>,
+    pub search_text: String,
+    pub tag_whitelist: String,
+    pub tag_blacklist: String,
+    pub sync_error: Option<String>,
+    pub loader_path_str: String,
+    pub download_progress: HashMap<DownloadId, worker::DownloadProgress>,
 }
 
 impl eframe::App for App {
@@ -97,7 +90,15 @@ impl eframe::App for App {
         }
         self.handle_server_op();
         self.refresh_tokens();
-        worker::handle(self);
+        worker::handle(Frontend::GUI(self));
+        if self
+            .config
+            .loader_path
+            .to_str()
+            .is_some_and(|str| self.loader_path_str != str)
+        {
+            Ok(self.config.loader_path) = PathBuf::from_str(&self.loader_path_str);
+        }
 
         ctx.request_repaint();
     }
@@ -147,6 +148,7 @@ impl eframe::App for App {
 
 impl App {
     pub fn new(config: Config) -> Result<Self, anyhow::Error> {
+        let loader_path = config.loader_path.to_string_lossy().to_string();
         Ok(Self {
             server_displays: HashMap::new(),
             hub_servers: HubStatus::Unfetched,
@@ -159,6 +161,8 @@ impl App {
             tag_whitelist: String::new(),
             tag_blacklist: String::new(),
             sync_error: None,
+            loader_path_str: loader_path,
+            download_progress: HashMap::new(),
         })
     }
 
@@ -220,6 +224,13 @@ impl App {
                 match &mut self.hub_servers {
                     HubStatus::Unfetched | HubStatus::Fetching => {
                         ui.vertical_centered(|ui| ui.weak("Loading hub server list.."));
+                        if let Some(prog) = self.download_progress.get(&DownloadId::ServerList) {
+                            if let Some(total) = prog.total {
+                                ui.vertical_centered(|ui| ui.weak(format!("{} / {} bytes downloaded", prog.current, total)));
+                            } else {
+                                ui.vertical_centered(|ui| ui.weak(format!("{} bytes downloaded", prog.current)));
+                            }
+                        }
                     }
                     HubStatus::Error(err) => {
                         ui.vertical_centered(|ui| {
@@ -330,9 +341,9 @@ impl App {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let response = ui.button("Browse...");
                     if response.clicked() {
-                        worker::start(worker::open_file_dialog(FileDialogTarget::LoaderPath))
+                        worker::open_file_dialog(FileDialogTarget::LoaderPath)
                     }
-                    egui::TextEdit::singleline(&mut self.config.loader_path)
+                    egui::TextEdit::singleline(&mut self.loader_path_str)
                         .hint_text(".../path/to/your/Robust.Loader")
                         .desired_width(ui.available_width())
                         .ui(ui);
@@ -373,7 +384,7 @@ impl App {
         egui::Grid::new("sync_grid").num_columns(2).show(ui, |ui| {
             let response = ui.button("Sync to:");
             if response.clicked() {
-                worker::start(worker::sync_signing_key(self.config.key_url.clone()));
+                worker::sync_signing_key(self.config.key_url.clone());
             }
             egui::TextEdit::singleline(&mut self.config.key_url)
                 .hint_text(config::DEFAULT_KEY_URL)
@@ -449,7 +460,7 @@ impl App {
                             *message = "The auth URL is malformed. Check your config.".into();
                             return;
                         };
-                        worker::start(worker::login(auth.clone(), url));
+                        worker::login(auth.clone(), url);
                         *message = "Logging in...".into();
                     }
                 });
@@ -510,7 +521,7 @@ impl App {
                 let Ok(url) = parse_dir_url(&self.config.auth_url) else {
                     return;
                 };
-                worker::start(worker::refresh_token(account.user_id.clone(), account.token.clone(), url));
+                worker::refresh_token(account.user_id.clone(), account.token.clone(), url);
             }
         }
     }
@@ -518,7 +529,7 @@ impl App {
     fn refresh_servers(&mut self) {
         self.hub_servers = HubStatus::Fetching;
 
-        worker::start(worker::fetch_servers(self.config.hub_url.clone()));
+        worker::fetch_servers(self.config.hub_url.clone());
     }
 
     fn draw_server(&self, ui: &mut egui::Ui, url: &str, mode: ServerDrawMode) -> bool {
@@ -852,7 +863,7 @@ impl App {
                     return;
                 };
                 server.status = FetchStatus::Fetching;
-                worker::start(worker::fetch_server_data(url));
+                worker::fetch_server_data(url);
             }
             ServerOperation::FetchInfo { url } => {
                 let Some(ServerDisplay {
@@ -863,7 +874,7 @@ impl App {
                     return;
                 };
                 *info = InfoStatus::Fetching;
-                worker::send(worker::fetch_server_info(url));
+                worker::fetch_server_info(url);
             }
         }
         let _ = self.config.save().warn_for_error();
@@ -902,13 +913,13 @@ impl App {
         });
     }
 
-    fn get_server_display(&self, url: &str) -> Option<&ServerDisplay> {
+    pub fn get_server_display(&self, url: &str) -> Option<&ServerDisplay> {
         self.server_displays
             .get(url)
             .filter(|server| self.matches_search(server))
     }
 
-    fn get_server_display_mut(&mut self, url: &str) -> Option<&mut ServerDisplay> {
+    pub fn get_server_display_mut(&mut self, url: &str) -> Option<&mut ServerDisplay> {
         let server = self.server_displays.get(url)?;
         if !self.matches_search(server) {
             return None;
@@ -926,14 +937,6 @@ fn parse_dir_url(url: &str) -> Result<Url, anyhow::Error> {
     let mut s = url.to_string();
     if !s.ends_with('/') {
         s.push('/');
-    }
-    Url::parse(&s).map_err(|e| anyhow::anyhow!(e))
-}
-
-fn parse_file_url(url: &str) -> Result<Url, anyhow::Error> {
-    let mut s = url.to_string();
-    if let Some(stripped) = s.strip_suffix('/') {
-        s = stripped.to_string();
     }
     Url::parse(&s).map_err(|e| anyhow::anyhow!(e))
 }
